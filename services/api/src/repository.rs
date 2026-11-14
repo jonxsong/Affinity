@@ -1,5 +1,6 @@
 use crate::domain::{
     ContentItem, Event, EventType, Experiment, IngestStatus, ModelVersion, OverviewStats,
+    ServingModel,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -36,10 +37,13 @@ pub trait Repository: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Event>, RepositoryError>;
+    async fn all_events(&self, limit: usize) -> Result<Vec<Event>, RepositoryError>;
     async fn all_content(&self) -> Result<Vec<ContentItem>, RepositoryError>;
     async fn overview(&self) -> Result<OverviewStats, RepositoryError>;
     async fn models(&self) -> Result<Vec<ModelVersion>, RepositoryError>;
     async fn model(&self, id: &str) -> Result<Option<ModelVersion>, RepositoryError>;
+    async fn active_serving_model(&self) -> Result<Option<ServingModel>, RepositoryError>;
+    async fn activate_serving_model(&self, model: &ServingModel) -> Result<(), RepositoryError>;
     async fn experiments(&self) -> Result<Vec<Experiment>, RepositoryError>;
     async fn experiment(&self, id: Uuid) -> Result<Option<Experiment>, RepositoryError>;
     async fn create_experiment(
@@ -186,6 +190,17 @@ impl Repository for PostgresRepository {
         rows.iter().map(Self::event_from_row).collect()
     }
 
+    async fn all_events(&self, limit: usize) -> Result<Vec<Event>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT event_id,user_id,content_id,event_type,occurred_at,session_id,context,surface,schema_version \
+             FROM events ORDER BY occurred_at DESC,event_id DESC LIMIT $1",
+        )
+        .bind(i64::try_from(limit).unwrap_or(100_000))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::event_from_row).collect()
+    }
+
     async fn all_content(&self) -> Result<Vec<ContentItem>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT content_id,title,category,description,quality_score,published_at,metadata FROM content_items ORDER BY content_id",
@@ -229,6 +244,49 @@ impl Repository for PostgresRepository {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(Self::model_from_row).transpose()
+    }
+
+    async fn active_serving_model(&self) -> Result<Option<ServingModel>, RepositoryError> {
+        let artifact: Option<Value> =
+            sqlx::query_scalar("SELECT artifact FROM active_serving_model WHERE singleton=TRUE")
+                .fetch_optional(&self.pool)
+                .await?;
+        artifact
+            .map(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| RepositoryError::InvalidData(error.to_string()))
+            })
+            .transpose()
+    }
+
+    async fn activate_serving_model(&self, model: &ServingModel) -> Result<(), RepositoryError> {
+        let artifact = serde_json::to_value(model)
+            .map_err(|error| RepositoryError::InvalidData(error.to_string()))?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO active_serving_model (singleton,artifact,activated_at) VALUES (TRUE,$1,now()) \
+             ON CONFLICT (singleton) DO UPDATE SET artifact=EXCLUDED.artifact,activated_at=now()",
+        )
+        .bind(artifact)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO model_versions (id,architecture,dataset_version,parameters,metrics,artifact_uri,trained_at,status) \
+             VALUES ($1,'empirical_bayes_prior','runtime-events',$2,$3,'postgres://active_serving_model',$4,'ready') \
+             ON CONFLICT (id) DO UPDATE SET parameters=EXCLUDED.parameters,metrics=EXCLUDED.metrics,artifact_uri=EXCLUDED.artifact_uri,trained_at=EXCLUDED.trained_at,status='ready'",
+        )
+        .bind(&model.model_id)
+        .bind(serde_json::json!({"schema_version":model.schema_version}))
+        .bind(serde_json::json!({
+            "training_event_count":model.training_event_count,
+            "category_feature_count":model.category_scores.len(),
+            "content_feature_count":model.content_scores.len()
+        }))
+        .bind(model.trained_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn experiments(&self) -> Result<Vec<Experiment>, RepositoryError> {
@@ -297,6 +355,7 @@ struct MemoryStore {
     experiments: Vec<Experiment>,
     models: Vec<ModelVersion>,
     training_jobs: Vec<(Uuid, String)>,
+    active_serving_model: Option<ServingModel>,
 }
 
 #[derive(Clone)]
@@ -412,6 +471,13 @@ impl Repository for MemoryRepository {
         Ok(events.into_iter().skip(offset).take(limit).collect())
     }
 
+    async fn all_events(&self, limit: usize) -> Result<Vec<Event>, RepositoryError> {
+        let mut events = self.store.read().await.events.clone();
+        events.sort_by_key(|event| std::cmp::Reverse((event.timestamp, event.event_id)));
+        events.truncate(limit);
+        Ok(events)
+    }
+
     async fn all_content(&self) -> Result<Vec<ContentItem>, RepositoryError> {
         Ok(self.store.read().await.content.clone())
     }
@@ -444,6 +510,41 @@ impl Repository for MemoryRepository {
             .iter()
             .find(|model| model.id == id)
             .cloned())
+    }
+
+    async fn active_serving_model(&self) -> Result<Option<ServingModel>, RepositoryError> {
+        Ok(self.store.read().await.active_serving_model.clone())
+    }
+
+    async fn activate_serving_model(&self, model: &ServingModel) -> Result<(), RepositoryError> {
+        let mut store = self.store.write().await;
+        store.active_serving_model = Some(model.clone());
+        let metrics = serde_json::json!({
+            "training_event_count":model.training_event_count,
+            "category_feature_count":model.category_scores.len(),
+            "content_feature_count":model.content_scores.len()
+        });
+        if let Some(version) = store
+            .models
+            .iter_mut()
+            .find(|item| item.id == model.model_id)
+        {
+            version.metrics = Some(metrics);
+            version.trained_at = Some(model.trained_at);
+            version.status = "ready".into();
+        } else {
+            store.models.push(ModelVersion {
+                id: model.model_id.clone(),
+                architecture: "empirical_bayes_prior".into(),
+                dataset_version: "runtime-events".into(),
+                parameters: serde_json::json!({"schema_version":model.schema_version}),
+                metrics: Some(metrics),
+                artifact_uri: Some("memory://active_serving_model".into()),
+                trained_at: Some(model.trained_at),
+                status: "ready".into(),
+            });
+        }
+        Ok(())
     }
 
     async fn experiments(&self) -> Result<Vec<Experiment>, RepositoryError> {

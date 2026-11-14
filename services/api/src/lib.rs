@@ -1,8 +1,11 @@
 mod domain;
 mod ranking;
 mod repository;
+mod training;
 
-pub use domain::{ContentItem, Event, EventType, Experiment, ModelVersion, Recommendation};
+pub use domain::{
+    ContentItem, Event, EventType, Experiment, ModelVersion, Recommendation, ServingModel,
+};
 pub use repository::{MemoryRepository, PostgresRepository, Repository};
 
 use axum::{
@@ -14,7 +17,7 @@ use axum::{
 };
 use chrono::Utc;
 use domain::IngestStatus;
-use ranking::{interests, recommend, RankingOptions};
+use ranking::{interests, recommend_with_model, RankingOptions};
 use repository::{arc, NewExperiment, RepositoryError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -32,6 +35,7 @@ use tower_http::{
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
+use training::train_serving_model;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -146,6 +150,11 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/content", get(get_content))
         .route("/v1/content/{content_id}/similar", get(get_similar))
         .route("/v1/models", get(get_models))
+        .route(
+            "/v1/models/active",
+            get(get_active_model).put(activate_model),
+        )
+        .route("/v1/models/train-serving", post(train_active_model))
         .route("/v1/models/{id}/metrics", get(get_model_metrics))
         .route("/v1/models/train", post(start_training))
         .route(
@@ -156,6 +165,8 @@ pub fn app(state: AppState) -> Router {
             "/v1/experiments/{id}/assignment/{user_id}",
             get(get_assignment),
         )
+        .route("/v1/sync/export/{user_id}", get(export_user_events))
+        .route("/v1/sync/import", post(import_user_events))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -167,7 +178,7 @@ pub fn app(state: AppState) -> Router {
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                 .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
         )
         .with_state(state)
@@ -188,6 +199,7 @@ async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
 
 async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let statistics = state.repository.overview().await?;
+    let active_model = state.repository.active_serving_model().await?;
     Ok(Json(json!({
         "total_users":statistics.total_users,
         "total_content_items":statistics.total_content_items,
@@ -196,7 +208,7 @@ async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError
         "recommendation_requests":state.recommendation_requests.load(Ordering::Relaxed),
         "storage":state.repository.kind(),
         "uptime_seconds":state.started_at.elapsed().as_secs(),
-        "active_model":"affinity-ranker-v1"
+        "active_model":active_model.as_ref().map(|model|model.model_id.as_str()).unwrap_or("affinity-ranker-v1")
     })))
 }
 
@@ -421,12 +433,20 @@ async fn get_recommendations(
     .validate()
     .map_err(ApiError::Validation)?;
     let (events, content) = user_data(&state, &user_id).await?;
-    let result = recommend(&events, &content, options, query.limit, Utc::now());
+    let active_model = state.repository.active_serving_model().await?;
+    let result = recommend_with_model(
+        &events,
+        &content,
+        options,
+        query.limit,
+        Utc::now(),
+        active_model.as_ref(),
+    );
     state
         .recommendation_requests
         .fetch_add(1, Ordering::Relaxed);
     Ok(Json(
-        json!({"user_id":user_id,"model_version":"affinity-ranker-v1","fallback_used":result.fallback_used,"items":result.items}),
+        json!({"user_id":user_id,"model_version":active_model.as_ref().map(|model|model.model_id.as_str()).unwrap_or("affinity-ranker-v1"),"fallback_used":result.fallback_used,"items":result.items}),
     ))
 }
 
@@ -466,6 +486,122 @@ async fn get_similar(
 
 async fn get_models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({"items":state.repository.models().await?})))
+}
+
+async fn get_active_model(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let model = state.repository.active_serving_model().await?;
+    Ok(Json(json!({
+        "active":model.is_some(),
+        "model":model,
+        "fallback_model":"affinity-ranker-v1"
+    })))
+}
+
+async fn activate_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(model): Json<ServingModel>,
+) -> Result<Json<Value>, ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    model.validate().map_err(ApiError::Validation)?;
+    state.repository.activate_serving_model(&model).await?;
+    Ok(Json(json!({
+        "status":"active",
+        "model_id":model.model_id,
+        "training_event_count":model.training_event_count
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ServingTrainingRequest {
+    #[serde(default = "default_training_event_limit")]
+    event_limit: usize,
+}
+
+const fn default_training_event_limit() -> usize {
+    100_000
+}
+
+async fn train_active_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ServingTrainingRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    if !(1..=1_000_000).contains(&request.event_limit) {
+        return Err(ApiError::Validation(
+            "event_limit must be between 1 and 1000000".into(),
+        ));
+    }
+    let (events, content) = tokio::try_join!(
+        state.repository.all_events(request.event_limit),
+        state.repository.all_content()
+    )?;
+    let model = train_serving_model(&events, &content, Utc::now());
+    model.validate().map_err(ApiError::Validation)?;
+    state.repository.activate_serving_model(&model).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"status":"active","model":model})),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncImport {
+    schema_version: u16,
+    events: Vec<Event>,
+}
+
+async fn export_user_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    let events = state.repository.user_events(&user_id, 100_000, 0).await?;
+    Ok(Json(json!({
+        "schema_version":1,
+        "exported_at":Utc::now(),
+        "user_id":user_id,
+        "event_count":events.len(),
+        "events":events
+    })))
+}
+
+async fn import_user_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(import): Json<SyncImport>,
+) -> Result<Json<Value>, ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    if import.schema_version != 1 || import.events.len() > 100_000 {
+        return Err(ApiError::Validation(
+            "sync payload must use schema_version=1 and contain at most 100000 events".into(),
+        ));
+    }
+    let now = Utc::now();
+    for event in &import.events {
+        event.validate(now).map_err(ApiError::Validation)?;
+    }
+    let statuses = state.repository.ingest(&import.events).await?;
+    let accepted = statuses
+        .iter()
+        .filter(|status| **status == IngestStatus::Accepted)
+        .count();
+    Ok(Json(json!({
+        "status":"complete",
+        "accepted":accepted,
+        "duplicates":statuses.len()-accepted,
+        "total":statuses.len()
+    })))
 }
 
 async fn get_model_metrics(
@@ -703,6 +839,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn trained_serving_model_is_activated_and_used() {
+        let app = app(AppState::test("secret"));
+        let observed = event(Uuid::new_v4(), "item_101", EventType::Save);
+        app.clone()
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&observed).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/models/train-serving")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"event_limit":1000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/recommendations/usr_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["model_version"], "behavioral-prior-v1");
+        assert_eq!(value["items"][0]["model_version"], "behavioral-prior-v1");
+    }
+
+    #[tokio::test]
+    async fn sync_export_and_import_are_authenticated_and_idempotent() {
+        let source = app(AppState::test("secret"));
+        let observed = event(Uuid::new_v4(), "item_201", EventType::Click);
+        source
+            .clone()
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&observed).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let export = source
+            .oneshot(
+                Request::get("/v1/sync/export/usr_test")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let export_body = export.into_body().collect().await.unwrap().to_bytes();
+        let mut payload: Value = serde_json::from_slice(&export_body).unwrap();
+        payload.as_object_mut().unwrap().remove("exported_at");
+        payload.as_object_mut().unwrap().remove("event_count");
+        payload.as_object_mut().unwrap().remove("user_id");
+
+        let destination = app(AppState::test("secret"));
+        for expected_accepted in [1, 0] {
+            let response = destination
+                .clone()
+                .oneshot(
+                    Request::post("/v1/sync/import")
+                        .header("authorization", "Bearer secret")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["accepted"], expected_accepted);
+        }
     }
 
     #[test]

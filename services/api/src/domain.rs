@@ -123,6 +123,58 @@ pub struct ModelVersion {
     pub status: String,
 }
 
+/// Portable online-serving artifact shared by the trainer, Rust API, and hosted Worker.
+/// Scores are bounded priors, not probabilities. They are blended with live behavior,
+/// freshness, and quality by the ranking policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServingModel {
+    pub schema_version: u16,
+    pub model_id: String,
+    pub trained_at: DateTime<Utc>,
+    pub training_event_count: usize,
+    #[serde(default)]
+    pub category_scores: HashMap<String, f32>,
+    #[serde(default)]
+    pub content_scores: HashMap<String, f32>,
+}
+
+impl ServingModel {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err("only serving model schema_version=1 is supported".into());
+        }
+        if self.model_id.trim().is_empty() || self.model_id.len() > 120 {
+            return Err("model_id must contain between 1 and 120 characters".into());
+        }
+        if self.category_scores.len() > 10_000 || self.content_scores.len() > 1_000_000 {
+            return Err("serving model exceeds the supported feature count".into());
+        }
+        for (feature, score) in self
+            .category_scores
+            .iter()
+            .chain(self.content_scores.iter())
+        {
+            if feature.trim().is_empty() || feature.len() > 200 {
+                return Err("serving model feature names must contain 1 to 200 characters".into());
+            }
+            if !score.is_finite() || !(0.0..=1.0).contains(score) {
+                return Err(format!(
+                    "serving score for {feature} must be between 0 and 1"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn score(&self, content_id: &str, category: &str) -> f32 {
+        self.content_scores
+            .get(content_id)
+            .copied()
+            .or_else(|| self.category_scores.get(category).copied())
+            .unwrap_or(0.5)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InterestScore {
     pub topic: String,
@@ -136,6 +188,7 @@ pub struct ScoreComponents {
     pub recency: f32,
     pub diversity: f32,
     pub quality: f32,
+    pub learned_prior: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,7 +201,7 @@ pub struct Recommendation {
     pub score_type: &'static str,
     pub components: ScoreComponents,
     pub explanation: String,
-    pub model_version: &'static str,
+    pub model_version: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

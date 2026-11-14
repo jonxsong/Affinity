@@ -1,5 +1,5 @@
 use crate::domain::{
-    ContentItem, Event, EventType, InterestScore, Recommendation, ScoreComponents,
+    ContentItem, Event, EventType, InterestScore, Recommendation, ScoreComponents, ServingModel,
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -152,12 +152,13 @@ pub struct RankingResult {
     pub fallback_used: bool,
 }
 
-pub fn recommend(
+pub fn recommend_with_model(
     events: &[Event],
     content: &[ContentItem],
     options: RankingOptions,
     limit: usize,
     now: DateTime<Utc>,
+    serving_model: Option<&ServingModel>,
 ) -> RankingResult {
     let profile = interests(events, content, now);
     let long_term: HashMap<_, _> = profile
@@ -191,10 +192,18 @@ pub fn recommend(
             };
             let age_days = (now - item.published_at).num_seconds().max(0) as f32 / 86_400.0;
             let recency = 2.0_f32.powf(-age_days / 21.0).clamp(0.0, 1.0);
-            let base = options.relevance_weight * relevance
+            let learned_prior = serving_model
+                .map(|model| model.score(&item.content_id, &item.category))
+                .unwrap_or(0.5);
+            let policy_score = options.relevance_weight * relevance
                 + options.recency_weight * recency
                 + options.quality_weight * item.quality_score;
-            (item, relevance, recency, base)
+            let base = if serving_model.is_some() {
+                0.80 * policy_score + 0.20 * learned_prior
+            } else {
+                policy_score
+            };
+            (item, relevance, recency, learned_prior, base)
         })
         .collect();
 
@@ -204,19 +213,24 @@ pub fn recommend(
         let (best_index, _) = candidates
             .iter()
             .enumerate()
-            .map(|(index, (item, _, _, base))| {
+            .map(|(index, (item, _, _, _, base))| {
                 let repeat_count = *categories.get(item.category.as_str()).unwrap_or(&0) as f32;
                 let adjusted = *base - options.diversity_weight * 0.12 * repeat_count;
                 (index, adjusted)
             })
             .max_by(|left, right| left.1.total_cmp(&right.1))
             .expect("non-empty candidate list");
-        let (item, relevance, recency, base) = candidates.swap_remove(best_index);
+        let (item, relevance, recency, learned_prior, base) = candidates.swap_remove(best_index);
         let repeat_count = *categories.get(item.category.as_str()).unwrap_or(&0);
         let diversity = 1.0 / (1.0 + repeat_count as f32);
         *categories.entry(item.category.as_str()).or_default() += 1;
         let score = (base + options.diversity_weight * 0.08 * diversity).clamp(0.0, 1.0);
-        let explanation = if fallback_used {
+        let explanation = if serving_model.is_some() && learned_prior >= 0.65 {
+            format!(
+                "The active trained model raised this {} item; live quality and freshness checks still apply.",
+                item.category
+            )
+        } else if fallback_used {
             format!(
                 "Cold-start fallback selected high-quality, recent {} content.",
                 item.category
@@ -244,9 +258,12 @@ pub fn recommend(
                 recency,
                 diversity,
                 quality: item.quality_score,
+                learned_prior,
             },
             explanation,
-            model_version: "affinity-ranker-v1",
+            model_version: serving_model
+                .map(|model| model.model_id.clone())
+                .unwrap_or_else(|| "affinity-ranker-v1".into()),
         });
     }
     RankingResult {
@@ -294,7 +311,14 @@ mod tests {
             surface: "test".into(),
             schema_version: 1,
         };
-        let result = recommend(&[event], &content(now), RankingOptions::default(), 3, now);
+        let result = recommend_with_model(
+            &[event],
+            &content(now),
+            RankingOptions::default(),
+            3,
+            now,
+            None,
+        );
         assert!(!result.fallback_used);
         assert_eq!(result.items[0].content_id, "ml-2");
         assert!(result.items.iter().all(|item| item.content_id != "ml"));
@@ -303,7 +327,8 @@ mod tests {
     #[test]
     fn empty_history_uses_labeled_fallback() {
         let now = Utc::now();
-        let result = recommend(&[], &content(now), RankingOptions::default(), 2, now);
+        let result =
+            recommend_with_model(&[], &content(now), RankingOptions::default(), 2, now, None);
         assert!(result.fallback_used);
         assert!(result.items[0].explanation.contains("Cold-start"));
     }
