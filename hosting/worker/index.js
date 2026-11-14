@@ -209,7 +209,46 @@ function error(code, message, status = 400, requestId = crypto.randomUUID()) {
 }
 
 function ownerId(request) {
-  return request.headers.get("oai-authenticated-user-id") || "local-preview";
+  const authenticated = request.headers.get("oai-authenticated-user-id");
+  if (authenticated) return `user:${authenticated}`;
+  const client = request.headers.get("x-affinity-client-id");
+  if (client && /^[a-zA-Z0-9_-]{16,100}$/.test(client))
+    return `client:${client}`;
+  return null;
+}
+
+function requireOwner(request, requestId) {
+  const owner = ownerId(request);
+  return owner
+    ? { owner }
+    : {
+        response: error(
+          "client_identity_required",
+          "A stable Affinity client identity is required.",
+          401,
+          requestId,
+        ),
+      };
+}
+
+function constantTimeEqual(left, right) {
+  const leftBytes = new TextEncoder().encode(left || "");
+  const rightBytes = new TextEncoder().encode(right || "");
+  let difference = leftBytes.length ^ rightBytes.length;
+  const length = Math.max(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1)
+    difference |= (leftBytes[index] || 0) ^ (rightBytes[index] || 0);
+  return difference === 0;
+}
+
+function adminAuthorized(request, env) {
+  const token = request.headers
+    .get("authorization")
+    ?.replace(/^Bearer\s+/i, "");
+  return (
+    Boolean(env.AFFINITY_ADMIN_TOKEN) &&
+    constantTimeEqual(token, env.AFFINITY_ADMIN_TOKEN)
+  );
 }
 
 function clamp(value, minimum, maximum, fallback) {
@@ -261,7 +300,12 @@ export function calculateInterests(events, now = Date.now()) {
   return { long_term: normalize(totals), recent: normalize(recentTotals) };
 }
 
-export function rankContent(events, options = {}, now = Date.now()) {
+export function rankContent(
+  events,
+  options = {},
+  now = Date.now(),
+  servingModel = null,
+) {
   const interests = calculateInterests(events, now);
   const interestWeights = new Map(
     interests.long_term.map((item) => [item.topic, item.weight]),
@@ -292,7 +336,11 @@ export function rankContent(events, options = {}, now = Date.now()) {
       );
       const recency = Math.exp(-ageDays / 30);
       const quality = item.quality_score;
-      return { ...item, relevance, recency, quality };
+      const learnedPrior =
+        servingModel?.content_scores?.[item.content_id] ??
+        servingModel?.category_scores?.[item.category] ??
+        0.5;
+      return { ...item, relevance, recency, quality, learnedPrior };
     },
   );
   const selected = [];
@@ -304,11 +352,14 @@ export function rankContent(events, options = {}, now = Date.now()) {
     for (let index = 0; index < candidates.length; index += 1) {
       const candidate = candidates[index];
       const diversity = 1 / (1 + (categoryCounts.get(candidate.category) || 0));
-      const score =
+      const policyScore =
         candidate.relevance * relevanceWeight +
         candidate.recency * recencyWeight +
         candidate.quality * qualityWeight +
         diversity * diversityWeight;
+      const score = servingModel
+        ? 0.8 * policyScore + 0.2 * candidate.learnedPrior
+        : policyScore;
       if (score > bestScore) {
         bestIndex = index;
         bestScore = score;
@@ -332,14 +383,128 @@ export function rankContent(events, options = {}, now = Date.now()) {
         recency: Number(candidate.recency.toFixed(6)),
         diversity: Number(bestDiversity.toFixed(6)),
         quality: candidate.quality,
+        learned_prior: Number(candidate.learnedPrior.toFixed(6)),
       },
-      explanation: fallbackUsed
-        ? "Cold-start selection based on content quality, freshness, and category diversity."
-        : `Matches observed ${candidate.category.replaceAll("_", " ")} behavior while balancing freshness and diversity.`,
-      model_version: "affinity-ranker-v1",
+      explanation:
+        servingModel && candidate.learnedPrior >= 0.65
+          ? `The active trained model raised this ${candidate.category.replaceAll("_", " ")} item; live quality and freshness checks still apply.`
+          : fallbackUsed
+            ? "Cold-start selection based on content quality, freshness, and category diversity."
+            : `Matches observed ${candidate.category.replaceAll("_", " ")} behavior while balancing freshness and diversity.`,
+      model_version: servingModel?.model_id || "affinity-ranker-v1",
     });
   }
   return { fallback_used: fallbackUsed, items: selected, interests };
+}
+
+function validateServingModel(model) {
+  if (
+    !model ||
+    model.schema_version !== 1 ||
+    typeof model.model_id !== "string" ||
+    !model.model_id.trim() ||
+    model.model_id.length > 120 ||
+    !Number.isInteger(model.training_event_count) ||
+    model.training_event_count < 0 ||
+    Number.isNaN(Date.parse(model.trained_at))
+  )
+    return "Serving model metadata is invalid.";
+  for (const scores of [model.category_scores, model.content_scores]) {
+    if (!scores || typeof scores !== "object" || Array.isArray(scores))
+      return "Serving model score maps are required.";
+    for (const [feature, score] of Object.entries(scores)) {
+      if (
+        !feature ||
+        feature.length > 200 ||
+        !Number.isFinite(score) ||
+        score < 0 ||
+        score > 1
+      )
+        return "Serving model features and scores are invalid.";
+    }
+  }
+  return null;
+}
+
+async function loadActiveModel(db) {
+  const row = await db
+    .prepare(
+      "SELECT artifact_json FROM affinity_active_model WHERE singleton = 1",
+    )
+    .first();
+  if (!row?.artifact_json) return null;
+  try {
+    const model = JSON.parse(row.artifact_json);
+    return validateServingModel(model) ? null : model;
+  } catch {
+    return null;
+  }
+}
+
+async function activateServingModel(db, model) {
+  await db
+    .prepare(
+      "INSERT INTO affinity_active_model (singleton,artifact_json,activated_at) VALUES (1,?,?) ON CONFLICT(singleton) DO UPDATE SET artifact_json=excluded.artifact_json,activated_at=excluded.activated_at",
+    )
+    .bind(JSON.stringify(model), new Date().toISOString())
+    .run();
+}
+
+function trainServingModel(events, now = Date.now()) {
+  const categorySignals = new Map();
+  const contentSignals = new Map();
+  const targets = {
+    content_impression: [0.45, 0.1],
+    content_view: [0.58, 0.45],
+    click: [0.68, 0.7],
+    like: [0.86, 1],
+    save: [0.92, 1.15],
+    share: [0.95, 1.2],
+    search: [0.6, 0.35],
+    dismiss: [0.08, 1],
+    follow: [0.9, 1.1],
+    dwell_time: [0.72, 0.65],
+    recommendation_conversion: [1, 1.4],
+  };
+  const observe = (map, feature, target, confidence) => {
+    const signal = map.get(feature) || { sum: 0, weight: 0 };
+    signal.sum += target * confidence;
+    signal.weight += confidence;
+    map.set(feature, signal);
+  };
+  for (const event of events) {
+    const content = CONTENT_BY_ID.get(event.content_id);
+    const target = targets[event.event_type];
+    if (!content || !target) continue;
+    const ageDays = Math.max(
+      0,
+      (now - Date.parse(event.timestamp)) / 86_400_000,
+    );
+    const confidence = target[1] * Math.max(0.05, 2 ** (-ageDays / 30));
+    observe(categorySignals, content.category, target[0], confidence);
+    observe(contentSignals, content.content_id, target[0], confidence);
+  }
+  const scores = (map, priorWeight) =>
+    Object.fromEntries(
+      [...map].map(([feature, signal]) => [
+        feature,
+        Math.min(
+          1,
+          Math.max(
+            0,
+            (signal.sum + 0.5 * priorWeight) / (signal.weight + priorWeight),
+          ),
+        ),
+      ]),
+    );
+  return {
+    schema_version: 1,
+    model_id: "behavioral-prior-v1",
+    trained_at: new Date(now).toISOString(),
+    training_event_count: events.length,
+    category_scores: scores(categorySignals, 3),
+    content_scores: scores(contentSignals, 6),
+  };
 }
 
 async function loadEvents(db, owner, userId, limit = 500) {
@@ -350,6 +515,59 @@ async function loadEvents(db, owner, userId, limit = 500) {
     .bind(owner, userId, limit)
     .all();
   return result.results || [];
+}
+
+function validateEvent(event) {
+  const required = [
+    "event_id",
+    "user_id",
+    "event_type",
+    "timestamp",
+    "session_id",
+    "surface",
+  ];
+  if (
+    !event ||
+    required.some(
+      (field) => typeof event[field] !== "string" || !event[field].trim(),
+    )
+  )
+    return "Event identifiers, type, timestamp, session, and surface are required.";
+  if (
+    !(event.event_type in EVENT_STRENGTH) ||
+    event.schema_version !== 1 ||
+    Number.isNaN(Date.parse(event.timestamp))
+  )
+    return "Unsupported event type, schema version, or timestamp.";
+  const eventTime = Date.parse(event.timestamp);
+  if (
+    eventTime > Date.now() + 5 * 60_000 ||
+    eventTime < Date.now() - 10 * 365 * 86_400_000
+  )
+    return "Event timestamp is outside the accepted retention window.";
+  if (event.content_id && !CONTENT_BY_ID.has(event.content_id))
+    return "Unknown content_id.";
+  return null;
+}
+
+async function insertEvent(db, owner, event) {
+  return db
+    .prepare(
+      "INSERT OR IGNORE INTO affinity_events (event_id,owner_id,user_id,content_id,event_type,timestamp,session_id,context_json,surface,schema_version) VALUES (?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(
+      event.event_id,
+      owner,
+      event.user_id.slice(0, 200),
+      event.content_id || null,
+      event.event_type,
+      new Date(event.timestamp).toISOString(),
+      event.session_id.slice(0, 200),
+      JSON.stringify(event.context || {}),
+      event.surface.slice(0, 100),
+      1,
+    )
+    .run();
 }
 
 async function handleApi(request, env, url) {
@@ -370,23 +588,25 @@ async function handleApi(request, env, url) {
     );
   }
   if (url.pathname === "/v1/overview" && request.method === "GET") {
-    const owner = ownerId(request);
-    const [events, users, requests] = await Promise.all([
+    const scope = requireOwner(request, requestId);
+    if (scope.response) return scope.response;
+    const [events, users, requests, activeModel] = await Promise.all([
       env.DB.prepare(
         "SELECT COUNT(*) AS count FROM affinity_events WHERE owner_id = ?",
       )
-        .bind(owner)
+        .bind(scope.owner)
         .first(),
       env.DB.prepare(
         "SELECT COUNT(DISTINCT user_id) AS count FROM affinity_events WHERE owner_id = ?",
       )
-        .bind(owner)
+        .bind(scope.owner)
         .first(),
       env.DB.prepare(
         "SELECT value FROM affinity_stats WHERE owner_id = ? AND key = 'recommendation_requests'",
       )
-        .bind(owner)
+        .bind(scope.owner)
         .first(),
+      loadActiveModel(env.DB),
     ]);
     return json({
       total_users: Number(users?.count || 0),
@@ -396,10 +616,12 @@ async function handleApi(request, env, url) {
       recommendation_requests: Number(requests?.value || 0),
       storage: "d1",
       uptime_seconds: Math.floor((Date.now() - STARTED_AT) / 1000),
-      active_model: "affinity-ranker-v1",
+      active_model: activeModel?.model_id || "affinity-ranker-v1",
     });
   }
   if (url.pathname === "/v1/events" && request.method === "POST") {
+    const scope = requireOwner(request, requestId);
+    if (scope.response) return scope.response;
     let event;
     try {
       event = await request.json();
@@ -411,69 +633,10 @@ async function handleApi(request, env, url) {
         requestId,
       );
     }
-    const required = [
-      "event_id",
-      "user_id",
-      "event_type",
-      "timestamp",
-      "session_id",
-      "surface",
-    ];
-    if (
-      required.some(
-        (field) => typeof event[field] !== "string" || !event[field].trim(),
-      )
-    ) {
-      return error(
-        "validation_error",
-        "Event identifiers, type, timestamp, session, and surface are required.",
-        422,
-        requestId,
-      );
-    }
-    if (
-      !(event.event_type in EVENT_STRENGTH) ||
-      event.schema_version !== 1 ||
-      Number.isNaN(Date.parse(event.timestamp))
-    ) {
-      return error(
-        "validation_error",
-        "Unsupported event type, schema version, or timestamp.",
-        422,
-        requestId,
-      );
-    }
-    const eventTime = Date.parse(event.timestamp);
-    if (
-      eventTime > Date.now() + 5 * 60_000 ||
-      eventTime < Date.now() - 10 * 365 * 86_400_000
-    ) {
-      return error(
-        "validation_error",
-        "Event timestamp is outside the accepted retention window.",
-        422,
-        requestId,
-      );
-    }
-    if (event.content_id && !CONTENT_BY_ID.has(event.content_id)) {
-      return error("validation_error", "Unknown content_id.", 422, requestId);
-    }
-    const result = await env.DB.prepare(
-      "INSERT OR IGNORE INTO affinity_events (event_id,owner_id,user_id,content_id,event_type,timestamp,session_id,context_json,surface,schema_version) VALUES (?,?,?,?,?,?,?,?,?,?)",
-    )
-      .bind(
-        event.event_id,
-        ownerId(request),
-        event.user_id.slice(0, 200),
-        event.content_id || null,
-        event.event_type,
-        new Date(event.timestamp).toISOString(),
-        event.session_id.slice(0, 200),
-        JSON.stringify(event.context || {}),
-        event.surface.slice(0, 100),
-        1,
-      )
-      .run();
+    const validationError = validateEvent(event);
+    if (validationError)
+      return error("validation_error", validationError, 422, requestId);
+    const result = await insertEvent(env.DB, scope.owner, event);
     return json(
       {
         event_id: event.event_id,
@@ -483,19 +646,157 @@ async function handleApi(request, env, url) {
       { "x-request-id": requestId },
     );
   }
-  if (url.pathname === "/v1/models" && request.method === "GET")
-    return json({ items: MODELS });
+  if (url.pathname === "/v1/models" && request.method === "GET") {
+    const activeModel = await loadActiveModel(env.DB);
+    const activeRegistry = activeModel
+      ? [
+          {
+            id: activeModel.model_id,
+            architecture: "empirical_bayes_prior",
+            dataset_version: "runtime-events",
+            parameters: { schema_version: activeModel.schema_version },
+            metrics: {
+              training_event_count: activeModel.training_event_count,
+              category_feature_count: Object.keys(activeModel.category_scores)
+                .length,
+              content_feature_count: Object.keys(activeModel.content_scores)
+                .length,
+            },
+            artifact_uri: "d1://affinity_active_model",
+            trained_at: activeModel.trained_at,
+            status: "ready",
+          },
+        ]
+      : [];
+    return json({
+      items: [
+        ...activeRegistry,
+        ...MODELS.filter((item) => item.id !== activeModel?.model_id),
+      ],
+    });
+  }
+  if (url.pathname === "/v1/models/active" && request.method === "GET") {
+    const model = await loadActiveModel(env.DB);
+    return json({
+      active: Boolean(model),
+      model,
+      fallback_model: "affinity-ranker-v1",
+    });
+  }
+  if (url.pathname === "/v1/models/active" && request.method === "PUT") {
+    if (!adminAuthorized(request, env))
+      return error(
+        "unauthorized",
+        "Admin authentication is required.",
+        401,
+        requestId,
+      );
+    const model = await request.json().catch(() => null);
+    const validationError = validateServingModel(model);
+    if (validationError)
+      return error("validation_error", validationError, 422, requestId);
+    await activateServingModel(env.DB, model);
+    return json({
+      status: "active",
+      model_id: model.model_id,
+      training_event_count: model.training_event_count,
+    });
+  }
+  if (
+    url.pathname === "/v1/models/train-serving" &&
+    request.method === "POST"
+  ) {
+    if (!adminAuthorized(request, env))
+      return error(
+        "unauthorized",
+        "Admin authentication is required.",
+        401,
+        requestId,
+      );
+    const rows = await env.DB.prepare(
+      "SELECT content_id,event_type,timestamp FROM affinity_events ORDER BY timestamp DESC LIMIT 100000",
+    ).all();
+    const model = trainServingModel(rows.results || []);
+    await activateServingModel(env.DB, model);
+    return json({ status: "active", model }, 201);
+  }
+  if (url.pathname === "/v1/sync/import" && request.method === "POST") {
+    if (!adminAuthorized(request, env))
+      return error(
+        "unauthorized",
+        "Admin authentication is required.",
+        401,
+        requestId,
+      );
+    const scope = requireOwner(request, requestId);
+    if (scope.response) return scope.response;
+    const payload = await request.json().catch(() => null);
+    if (
+      !payload ||
+      payload.schema_version !== 1 ||
+      !Array.isArray(payload.events) ||
+      payload.events.length > 100_000
+    )
+      return error(
+        "validation_error",
+        "Sync payload must use schema_version=1 and contain at most 100000 events.",
+        422,
+        requestId,
+      );
+    let accepted = 0;
+    for (const event of payload.events) {
+      const validationError = validateEvent(event);
+      if (validationError)
+        return error("validation_error", validationError, 422, requestId);
+      const result = await insertEvent(env.DB, scope.owner, event);
+      accepted += Number(result.meta?.changes || 0);
+    }
+    return json({
+      status: "complete",
+      accepted,
+      duplicates: payload.events.length - accepted,
+      total: payload.events.length,
+    });
+  }
   if (url.pathname === "/v1/experiments" && request.method === "GET")
     return json({ items: EXPERIMENTS });
 
-  let match = url.pathname.match(
+  let match = url.pathname.match(/^\/v1\/sync\/export\/([^/]+)$/);
+  if (match && request.method === "GET") {
+    if (!adminAuthorized(request, env))
+      return error(
+        "unauthorized",
+        "Admin authentication is required.",
+        401,
+        requestId,
+      );
+    const scope = requireOwner(request, requestId);
+    if (scope.response) return scope.response;
+    const userId = decodeURIComponent(match[1]);
+    const events = await loadEvents(env.DB, scope.owner, userId, 100_000);
+    return json({
+      schema_version: 1,
+      exported_at: new Date().toISOString(),
+      user_id: userId,
+      event_count: events.length,
+      events: events.map((event) => ({
+        ...event,
+        context: JSON.parse(event.context_json || "{}"),
+        context_json: undefined,
+      })),
+    });
+  }
+
+  match = url.pathname.match(
     /^\/v1\/users\/([^/]+)(?:\/(interests|history))?$/,
   );
   if (match && request.method === "GET") {
+    const scope = requireOwner(request, requestId);
+    if (scope.response) return scope.response;
     const userId = decodeURIComponent(match[1]);
     const events = await loadEvents(
       env.DB,
-      ownerId(request),
+      scope.owner,
       userId,
       match[2] === "history" ? 50 : 500,
     );
@@ -532,18 +833,27 @@ async function handleApi(request, env, url) {
 
   match = url.pathname.match(/^\/v1\/recommendations\/([^/]+)$/);
   if (match && request.method === "GET") {
-    const owner = ownerId(request);
+    const scope = requireOwner(request, requestId);
+    if (scope.response) return scope.response;
     const userId = decodeURIComponent(match[1]);
-    const events = await loadEvents(env.DB, owner, userId);
-    const ranked = rankContent(events, Object.fromEntries(url.searchParams));
+    const [events, activeModel] = await Promise.all([
+      loadEvents(env.DB, scope.owner, userId),
+      loadActiveModel(env.DB),
+    ]);
+    const ranked = rankContent(
+      events,
+      Object.fromEntries(url.searchParams),
+      Date.now(),
+      activeModel,
+    );
     await env.DB.prepare(
       "INSERT INTO affinity_stats (owner_id,key,value) VALUES (?,'recommendation_requests',1) ON CONFLICT(owner_id,key) DO UPDATE SET value = value + 1",
     )
-      .bind(owner)
+      .bind(scope.owner)
       .run();
     return json({
       user_id: userId,
-      model_version: "affinity-ranker-v1",
+      model_version: activeModel?.model_id || "affinity-ranker-v1",
       fallback_used: ranked.fallback_used,
       items: ranked.items,
     });

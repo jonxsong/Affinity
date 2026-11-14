@@ -42,6 +42,26 @@ test("positive events personalize ranking and filter seen content", () => {
   assert.equal(result.items[0].category, "applied_ml");
 });
 
+test("portable serving model contributes a learned prior", () => {
+  const model = {
+    schema_version: 1,
+    model_id: "behavioral-prior-v1",
+    trained_at: "2026-11-14T12:00:00Z",
+    training_event_count: 20,
+    category_scores: { design_tools: 0.99 },
+    content_scores: {},
+  };
+  const result = worker.rankContent(
+    [],
+    { limit: 12 },
+    Date.parse("2026-11-14T12:00:00Z"),
+    model,
+  );
+  assert.equal(result.items[0].category, "design_tools");
+  assert.equal(result.items[0].model_version, "behavioral-prior-v1");
+  assert.equal(result.items[0].components.learned_prior, 0.99);
+});
+
 test("health endpoint validates the D1 binding", async () => {
   const DB = { prepare: () => ({ first: async () => ({ ok: 1 }) }) };
   const response = await worker.default.fetch(

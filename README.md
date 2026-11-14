@@ -21,6 +21,8 @@ An open-source recommendation platform for learning from behavior, training mode
 > [!NOTE]
 > The hosted console is a working application, not a static mock: its same-origin Worker validates events, stores behavior in D1, and returns explained, personalized recommendations. The Docker stack provides the fuller Rust/PostgreSQL/Python research environment. Synthetic data is always labeled.
 
+The live console is publicly accessible. Each browser receives a random local client identifier so anonymous visitors do not share behavioral history.
+
 ## Why Affinity
 
 Recommendation systems are learning systems, not one `predict()` call. Affinity makes the full loop inspectable:
@@ -112,6 +114,36 @@ docker compose --profile training up --build
 
 Admin mutations use `AFFINITY_ADMIN_TOKEN`; Compose supplies a development-only default. Set a strong value before exposing the API outside localhost.
 
+### Train and serve the online model
+
+The Rust API can train a compact empirical-Bayes prior from durable behavioral events, store the portable artifact transactionally, and blend it into online ranking without a Python process in the request path:
+
+```bash
+curl -X POST http://localhost:8080/v1/models/train-serving \
+  -H "Authorization: Bearer $AFFINITY_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"event_limit":100000}'
+```
+
+`GET /v1/models/active` reports the deployed artifact. `PUT /v1/models/active` accepts the same validated JSON contract used by the hosted Worker.
+
+### Synchronize one user's events
+
+Synchronization is explicit, authenticated, idempotent, and safe to repeat. It never silently merges the hosted and local data planes:
+
+```bash
+export AFFINITY_SOURCE_TOKEN="source-admin-token"
+export AFFINITY_DESTINATION_TOKEN="destination-admin-token"
+cargo run --release --manifest-path services/api/Cargo.toml \
+  --bin affinity-sync -- \
+  --source http://localhost:8080 \
+  --destination https://affinity-recommendations.perkyaisle4.chatgpt.site \
+  --user-id usr_example \
+  --client-id web_your_browser_client_id
+```
+
+Tokens are read only from the environment and are never written to the export or command output.
+
 ## Repository map
 
 ```text
@@ -158,11 +190,16 @@ DELETE /v1/users/{id}                    # bearer-protected privacy deletion
 GET  /v1/recommendations/{user_id}      # explained ranked list
 GET  /v1/content/{content_id}/similar   # vector-similar candidates
 GET  /v1/models                         # registry
+GET  /v1/models/active                  # active portable serving artifact
+PUT  /v1/models/active                  # bearer-protected artifact activation
+POST /v1/models/train-serving           # bearer-protected Rust online-model training
 POST /v1/models/train                   # bearer-protected admin operation
 GET  /v1/experiments                    # deterministic experiment definitions
 POST /v1/experiments                    # bearer-protected mutation
 GET  /v1/experiments/{id}/assignment/{user_id}
 GET  /v1/overview                       # live product and service summary
+GET  /v1/sync/export/{user_id}          # bearer-protected portable event export
+POST /v1/sync/import                    # bearer-protected idempotent event import
 GET  /health · /ready · /metrics
 ```
 
@@ -185,11 +222,23 @@ Errors use a stable envelope with `code`, `message`, and `request_id`. Recommend
 | Python | Ruff, temporal leakage, deterministic seeds, full training-artifact smoke test, model shapes |
 | Infrastructure | Compose validation and health contracts |
 
+### Measured local serving workload
+
+The checked-in Rust runner alternates event ingestion and personalized recommendation reads. On commit `f9f75ae`, 1,000 requests at concurrency 16 completed with no failures on the documented Windows/Docker host: **4,121.6 requests/s**, **3.16 ms p50**, **5.67 ms p95**, and **24.48 ms p99**. This is a local smoke measurement, not a universal capacity claim. The full machine, workload, and result metadata is committed in [`benchmarks/results/2026-11-14-local.json`](benchmarks/results/2026-11-14-local.json).
+
+Run the same workload against any deployment:
+
+```bash
+cargo run --release --manifest-path services/api/Cargo.toml \
+  --bin affinity-benchmark -- \
+  --base-url http://localhost:8080 --requests 1000 --concurrency 16
+```
+
 All required checks run in [GitHub Actions](https://github.com/jonxsong/Affinity/actions/workflows/ci.yml) without paid credentials.
 
 ## Known limitations
 
-- The live Rust serving policy uses durable behavioral signals; trained SVD/two-tower/GRU artifacts are registered but are not yet loaded into the online candidate path.
+- The active online artifact is a portable behavioral prior. SVD, two-tower, and GRU4Rec remain offline comparison models until their candidate embeddings are exported into this serving contract.
 - Redis, Qdrant, Redpanda, and MLflow are optional topology extension points, not dependencies of the current request path.
 - Hosted D1 and local PostgreSQL are separate data planes; interaction history does not automatically replicate between them.
 - No throughput or production-latency number is claimed yet.
@@ -201,9 +250,12 @@ All required checks run in [GitHub Actions](https://github.com/jonxsong/Affinity
 - [x] Interactive user, embedding, ranking, registry, experiment, and observability console
 - [x] Reproducible temporal evaluation, versioned artifacts, and durable training worker
 - [x] Durable Rust repository, migrations, privacy deletion, and integration coverage
-- [ ] Qdrant export plus online ML inference client
+- [x] Portable trained-model artifact loaded by the Rust API and hosted Worker
+- [x] Authenticated, idempotent hosted/local event synchronization
+- [x] Reproducible mixed serving benchmark with checked-in hardware metadata
+- [ ] Qdrant export for high-cardinality learned candidate retrieval
 - [ ] MovieLens model card with repeated-seed confidence intervals
-- [ ] Measured ingestion and serving benchmarks across documented hardware
+- [ ] Repeated benchmarks across additional documented hardware
 
 ## Contributing
 

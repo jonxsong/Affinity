@@ -136,6 +136,7 @@ impl IntoResponse for ApiError {
 
 pub fn app(state: AppState) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
+    let client_id_header = HeaderName::from_static("x-affinity-client-id");
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -179,7 +180,11 @@ pub fn app(state: AppState) -> Router {
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                    client_id_header,
+                ]),
         )
         .with_state(state)
 }

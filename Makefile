@@ -1,4 +1,4 @@
-.PHONY: setup dev seed train evaluate test benchmark build
+.PHONY: setup dev seed train evaluate test benchmark benchmark-rust build
 
 setup:
 	pnpm install
@@ -23,6 +23,9 @@ test:
 
 benchmark:
 	docker compose --profile benchmark run --rm k6 run /scripts/ingestion.js
+
+benchmark-rust:
+	cargo run --release --manifest-path services/api/Cargo.toml --bin affinity-benchmark -- --base-url http://localhost:8080 --requests 1000 --concurrency 16
 
 build:
 	pnpm build

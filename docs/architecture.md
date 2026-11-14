@@ -19,6 +19,8 @@ contracts as an external client.
    scores.
 4. New users receive a deterministic cold-start ranking; after an interaction,
    the response switches to personalized ranking and includes score evidence.
+5. Anonymous visitors are isolated by a random browser-local client identifier;
+   authenticated visitors use the platform-provided stable Site identity.
 
 ## Complete local stack data flow
 
@@ -33,6 +35,17 @@ contracts as an external client.
 6. Requests load candidates and behavior, filter seen content, score, diversify, and
    return explicit score components. Heuristic scores are never called
    probabilities.
+7. The Rust trainer can learn a portable behavioral-prior artifact, persist it
+   transactionally, and blend its category/content priors into the online policy.
+
+## Data portability
+
+The Rust API and hosted Worker implement the same versioned sync envelope.
+Export and import endpoints require an admin bearer token, validate every event,
+and reuse event IDs for idempotency. The `affinity-sync` Rust CLI keeps source and
+destination tokens in environment variables and reports accepted versus duplicate
+counts. Synchronization remains an explicit operator action; the two databases do
+not create an accidental bidirectional replication loop.
 
 The local application uses PostgreSQL and requires no paid service or OpenAI
 API key. Redis, Qdrant, Redpanda, and MLflow are optional extension points
@@ -46,6 +59,7 @@ remain separate data planes.
 - Batched ingestion reports accepted, duplicate, and rejected counts.
 - Recommendation serving falls back from personalized behavior to content quality and recency.
 - Hosted events and recommendation counters persist in D1 across Worker instances.
+- Active serving artifacts persist in PostgreSQL or D1 and survive process restarts.
 - Admin mutations require a bearer token.
 - Privacy deletion removes a user's durable event history.
 - Training job claims use row locks and skip already-claimed work.

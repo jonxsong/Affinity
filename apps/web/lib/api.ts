@@ -69,6 +69,7 @@ const scoreComponentsSchema = z.object({
   recency: z.number(),
   diversity: z.number(),
   quality: z.number(),
+  learned_prior: z.number().optional(),
 });
 
 const recommendationSchema = z.object({
@@ -133,14 +134,31 @@ export class ApiClientError extends Error {
   }
 }
 
+const clientIdStorageKey = "affinity.client-id.v1";
+
+function browserClientId(): string | null {
+  if (typeof window === "undefined") return null;
+  let clientId = window.localStorage.getItem(clientIdStorageKey);
+  if (!clientId) {
+    clientId = `web_${crypto.randomUUID().replaceAll("-", "")}`;
+    window.localStorage.setItem(clientIdStorageKey, clientId);
+  }
+  return clientId;
+}
+
 async function request<T>(
   path: string,
   schema: z.ZodType<T>,
   init?: RequestInit,
 ): Promise<T> {
+  const clientId = browserClientId();
   const response = await fetch(`${apiBaseUrl}${path}`, {
     ...init,
-    headers: { "content-type": "application/json", ...init?.headers },
+    headers: {
+      "content-type": "application/json",
+      ...(clientId ? { "x-affinity-client-id": clientId } : {}),
+      ...init?.headers,
+    },
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
