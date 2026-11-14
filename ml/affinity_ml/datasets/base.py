@@ -50,7 +50,9 @@ class InteractionDataset:
         )
 
 
-def synthetic_fixture(users: int = 32, items: int = 64, interactions_per_user: int = 12, seed: int = 42) -> InteractionDataset:
+def synthetic_fixture(
+    users: int = 32, items: int = 64, interactions_per_user: int = 12, seed: int = 42
+) -> InteractionDataset:
     """Deterministic fixture for tests and demos; never represented as real traffic."""
     rng = np.random.default_rng(seed)
     values = []
@@ -62,4 +64,3 @@ def synthetic_fixture(users: int = 32, items: int = 64, interactions_per_user: i
             values.append((user, int(item), 1_700_000_000 + user * 100 + step, 1.0 + (step % 3) * 0.25))
     array = np.asarray(sorted(values, key=lambda row: row[2]), dtype=np.float64)
     return InteractionDataset(array, "synthetic-cluster-fixture", f"seed-{seed}", "generated")
-

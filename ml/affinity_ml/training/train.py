@@ -13,10 +13,20 @@ def main() -> None:
     model = ImplicitSVD(factors=16).fit(split.train)
     artifact = Path("artifacts/implicit-svd-demo.json")
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text(json.dumps({"model":"implicit_svd","dataset":dataset.name,"dataset_version":dataset.version,"factors":model.factors,"measured_metrics":None}, indent=2))
+    artifact.write_text(
+        json.dumps(
+            {
+                "model": "implicit_svd",
+                "dataset": dataset.name,
+                "dataset_version": dataset.version,
+                "factors": model.factors,
+                "measured_metrics": None,
+            },
+            indent=2,
+        )
+    )
     print(f"wrote {artifact}")
 
 
 if __name__ == "__main__":
     main()
-

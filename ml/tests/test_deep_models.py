@@ -17,4 +17,3 @@ def test_gru4rec_produces_item_logits() -> None:
     model = GRU4Rec(items=20, embedding_dim=8, hidden_dim=12)
     logits = model(torch.tensor([[1, 2, 3], [4, 5, 20]]), torch.tensor([3, 2]))
     assert logits.shape == (2, 20)
-

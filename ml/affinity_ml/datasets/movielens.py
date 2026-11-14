@@ -31,4 +31,3 @@ def load(archive: Path) -> InteractionDataset:
         rows.append((int(user) - 1, int(item) - 1, int(timestamp), max(float(rating) - 2.5, 0.25)))
     values = np.asarray(sorted(rows, key=lambda row: row[2]), dtype=np.float64)
     return InteractionDataset(values, "MovieLens 100K", "ml-100k", MOVIELENS_100K_URL)
-

@@ -33,4 +33,3 @@ def intra_list_diversity(recommendations: list[int], embeddings: np.ndarray) -> 
     similarities = vectors @ vectors.T
     upper = similarities[np.triu_indices(len(vectors), k=1)]
     return float(np.mean(1 - upper))
-

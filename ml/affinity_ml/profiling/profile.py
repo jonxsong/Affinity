@@ -28,5 +28,6 @@ class DisabledProvider:
     """Safe default when no optional LLM provider is configured."""
 
     def create_profile(self, behavior_summary: str) -> SemanticProfile:
-        return SemanticProfile(interests=[], recent_intent=[], observed_behavior=[behavior_summary], inferred_hypotheses=[])
-
+        return SemanticProfile(
+            interests=[], recent_intent=[], observed_behavior=[behavior_summary], inferred_hypotheses=[]
+        )

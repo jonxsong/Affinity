@@ -20,4 +20,3 @@ class GRU4Rec(nn.Module):
             index = (lengths - 1).clamp_min(0).view(-1, 1, 1).expand(-1, 1, encoded.size(-1))
             final = encoded.gather(1, index).squeeze(1)
         return self.output(final)
-

@@ -1,5 +1,4 @@
 import numpy as np
-
 from affinity_ml.datasets.base import synthetic_fixture
 from affinity_ml.evaluation.metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 from affinity_ml.features.user import time_decay_weights
@@ -40,4 +39,3 @@ def test_reproducible_fixture_and_factorization() -> None:
     model_a = ImplicitSVD(4).fit(a.temporal_split().train)
     model_b = ImplicitSVD(4).fit(b.temporal_split().train)
     assert model_a.recommend(0) == model_b.recommend(0)
-

@@ -12,7 +12,7 @@ class ImplicitSVD:
         self.item_factors: np.ndarray | None = None
         self.seen: dict[int, set[int]] = {}
 
-    def fit(self, interactions: np.ndarray) -> "ImplicitSVD":
+    def fit(self, interactions: np.ndarray) -> ImplicitSVD:
         if not len(interactions):
             raise ValueError("cannot fit an empty interaction matrix")
         users = interactions[:, 0].astype(int)
@@ -40,13 +40,15 @@ class ImplicitSVD:
 
 
 class Popularity:
-    def fit(self, interactions: np.ndarray) -> "Popularity":
+    def fit(self, interactions: np.ndarray) -> Popularity:
         items = interactions[:, 1].astype(int)
         self.ranking = np.argsort(-np.bincount(items), kind="stable").tolist()
-        self.seen = {int(user): set(interactions[interactions[:, 0] == user, 1].astype(int)) for user in np.unique(interactions[:, 0])}
+        self.seen = {
+            int(user): set(interactions[interactions[:, 0] == user, 1].astype(int))
+            for user in np.unique(interactions[:, 0])
+        }
         return self
 
     def recommend(self, user_id: int, limit: int = 10) -> list[int]:
         seen = self.seen.get(user_id, set())
         return [item for item in self.ranking if item not in seen][:limit]
-
