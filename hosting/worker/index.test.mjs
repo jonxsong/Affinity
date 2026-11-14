@@ -76,3 +76,46 @@ test("health endpoint validates the D1 binding", async () => {
     version: "1",
   });
 });
+
+test("durable rate limiter isolates owners and returns retry guidance", async () => {
+  const counts = new Map();
+  const DB = {
+    prepare(sql) {
+      let values = [];
+      return {
+        bind(...bound) {
+          values = bound;
+          return this;
+        },
+        async run() {
+          if (sql.startsWith("INSERT INTO affinity_rate_limits")) {
+            const key = values.join(":");
+            counts.set(key, (counts.get(key) || 0) + 1);
+          }
+          return { meta: { changes: 1 } };
+        },
+        async first() {
+          const key = values.join(":");
+          return { request_count: counts.get(key) || 0 };
+        },
+      };
+    },
+  };
+  assert.equal(
+    await worker.enforceRateLimit(DB, "owner-a", "events", 1, "request-1"),
+    null,
+  );
+  const limited = await worker.enforceRateLimit(
+    DB,
+    "owner-a",
+    "events",
+    1,
+    "request-2",
+  );
+  assert.equal(limited.status, 429);
+  assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+  assert.equal(
+    await worker.enforceRateLimit(DB, "owner-b", "events", 1, "request-3"),
+    null,
+  );
+});

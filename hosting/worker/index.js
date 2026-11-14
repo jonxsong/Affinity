@@ -197,6 +197,10 @@ function json(payload, status = 200, extraHeaders = {}) {
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "permissions-policy": "camera=(), microphone=(), geolocation=()",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
       ...extraHeaders,
     },
   });
@@ -570,6 +574,38 @@ async function insertEvent(db, owner, event) {
     .run();
 }
 
+export async function enforceRateLimit(db, owner, bucket, limit, requestId) {
+  const windowStarted = Math.floor(Date.now() / 60_000) * 60_000;
+  await db
+    .prepare(
+      "INSERT INTO affinity_rate_limits (owner_id,bucket,window_started,request_count) VALUES (?,?,?,1) ON CONFLICT(owner_id,bucket,window_started) DO UPDATE SET request_count=request_count+1",
+    )
+    .bind(owner, bucket, windowStarted)
+    .run();
+  const row = await db
+    .prepare(
+      "SELECT request_count FROM affinity_rate_limits WHERE owner_id=? AND bucket=? AND window_started=?",
+    )
+    .bind(owner, bucket, windowStarted)
+    .first();
+  if (Number(row?.request_count || 0) <= limit) return null;
+  const retryAfter = Math.max(
+    1,
+    Math.ceil((windowStarted + 60_000 - Date.now()) / 1000),
+  );
+  return json(
+    {
+      error: {
+        code: "rate_limit_exceeded",
+        message: "Too many requests. Retry after the indicated delay.",
+        request_id: requestId,
+      },
+    },
+    429,
+    { "x-request-id": requestId, "retry-after": String(retryAfter) },
+  );
+}
+
 async function handleApi(request, env, url) {
   const requestId = request.headers.get("x-request-id") || crypto.randomUUID();
   if (!env.DB)
@@ -590,6 +626,14 @@ async function handleApi(request, env, url) {
   if (url.pathname === "/v1/overview" && request.method === "GET") {
     const scope = requireOwner(request, requestId);
     if (scope.response) return scope.response;
+    const limited = await enforceRateLimit(
+      env.DB,
+      scope.owner,
+      "overview",
+      120,
+      requestId,
+    );
+    if (limited) return limited;
     const [events, users, requests, activeModel] = await Promise.all([
       env.DB.prepare(
         "SELECT COUNT(*) AS count FROM affinity_events WHERE owner_id = ?",
@@ -622,6 +666,14 @@ async function handleApi(request, env, url) {
   if (url.pathname === "/v1/events" && request.method === "POST") {
     const scope = requireOwner(request, requestId);
     if (scope.response) return scope.response;
+    const limited = await enforceRateLimit(
+      env.DB,
+      scope.owner,
+      "event-ingest",
+      60,
+      requestId,
+    );
+    if (limited) return limited;
     let event;
     try {
       event = await request.json();
@@ -720,6 +772,36 @@ async function handleApi(request, env, url) {
     await activateServingModel(env.DB, model);
     return json({ status: "active", model }, 201);
   }
+  if (url.pathname === "/v1/admin/maintenance" && request.method === "POST") {
+    if (!adminAuthorized(request, env))
+      return error(
+        "unauthorized",
+        "Admin authentication is required.",
+        401,
+        requestId,
+      );
+    const payload = await request.json().catch(() => ({}));
+    const retentionDays = clamp(payload.retention_days, 30, 3650, 365);
+    const cutoff = new Date(
+      Date.now() - retentionDays * 86_400_000,
+    ).toISOString();
+    const eventResult = await env.DB.prepare(
+      "DELETE FROM affinity_events WHERE timestamp < ?",
+    )
+      .bind(cutoff)
+      .run();
+    const rateLimitResult = await env.DB.prepare(
+      "DELETE FROM affinity_rate_limits WHERE window_started < ?",
+    )
+      .bind(Date.now() - 86_400_000)
+      .run();
+    return json({
+      status: "complete",
+      retention_days: retentionDays,
+      deleted_events: Number(eventResult.meta?.changes || 0),
+      deleted_rate_limit_windows: Number(rateLimitResult.meta?.changes || 0),
+    });
+  }
   if (url.pathname === "/v1/sync/import" && request.method === "POST") {
     if (!adminAuthorized(request, env))
       return error(
@@ -793,6 +875,14 @@ async function handleApi(request, env, url) {
   if (match && request.method === "GET") {
     const scope = requireOwner(request, requestId);
     if (scope.response) return scope.response;
+    const limited = await enforceRateLimit(
+      env.DB,
+      scope.owner,
+      "user-read",
+      180,
+      requestId,
+    );
+    if (limited) return limited;
     const userId = decodeURIComponent(match[1]);
     const events = await loadEvents(
       env.DB,
@@ -830,11 +920,34 @@ async function handleApi(request, env, url) {
       inferred_sensitive_attributes: [],
     });
   }
+  if (match && request.method === "DELETE") {
+    const scope = requireOwner(request, requestId);
+    if (scope.response) return scope.response;
+    const userId = decodeURIComponent(match[1]);
+    const result = await env.DB.prepare(
+      "DELETE FROM affinity_events WHERE owner_id = ? AND user_id = ?",
+    )
+      .bind(scope.owner, userId)
+      .run();
+    return json({
+      user_id: userId,
+      deleted_events: Number(result.meta?.changes || 0),
+      status: "deleted",
+    });
+  }
 
   match = url.pathname.match(/^\/v1\/recommendations\/([^/]+)$/);
   if (match && request.method === "GET") {
     const scope = requireOwner(request, requestId);
     if (scope.response) return scope.response;
+    const limited = await enforceRateLimit(
+      env.DB,
+      scope.owner,
+      "recommendations",
+      120,
+      requestId,
+    );
+    if (limited) return limited;
     const userId = decodeURIComponent(match[1]);
     const [events, activeModel] = await Promise.all([
       loadEvents(env.DB, scope.owner, userId),
@@ -886,6 +999,11 @@ function serveAsset(request, url) {
       : "no-cache",
     "x-content-type-options": "nosniff",
     "referrer-policy": "strict-origin-when-cross-origin",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()",
+    "strict-transport-security": "max-age=31536000; includeSubDomains",
+    "x-frame-options": "DENY",
+    "content-security-policy":
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
   };
   return new Response(request.method === "HEAD" ? null : decodeAsset(asset), {
     status: notFound ? 404 : 200,
