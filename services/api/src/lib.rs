@@ -1,5 +1,6 @@
 mod domain;
 mod ranking;
+mod rate_limit;
 mod repository;
 mod training;
 
@@ -9,8 +10,10 @@ pub use domain::{
 pub use repository::{MemoryRepository, PostgresRepository, Repository};
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderName, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -18,6 +21,7 @@ use axum::{
 use chrono::Utc;
 use domain::IngestStatus;
 use ranking::{interests, recommend_with_model, RankingOptions};
+use rate_limit::RateLimiter;
 use repository::{arc, NewExperiment, RepositoryError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,6 +48,7 @@ pub struct AppState {
     admin_token: Arc<str>,
     recommendation_requests: Arc<AtomicU64>,
     started_at: Instant,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -62,6 +67,7 @@ impl AppState {
             admin_token: admin_token.into(),
             recommendation_requests: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
+            rate_limiter: Arc::new(RateLimiter::per_minute(120)),
         }
     }
 }
@@ -137,10 +143,7 @@ impl IntoResponse for ApiError {
 pub fn app(state: AppState) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
     let client_id_header = HeaderName::from_static("x-affinity-client-id");
-    Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics))
+    let api = Router::new()
         .route("/v1/overview", get(overview))
         .route("/v1/events", post(ingest_event))
         .route("/v1/events/batch", post(ingest_batch))
@@ -168,6 +171,15 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/v1/sync/export/{user_id}", get(export_user_events))
         .route("/v1/sync/import", post(import_user_events))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_rate_limit,
+        ));
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .merge(api)
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -187,6 +199,40 @@ pub fn app(state: AppState) -> Router {
                 ]),
         )
         .with_state(state)
+}
+
+async fn enforce_rate_limit(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if authorized(request.headers(), &state) {
+        return next.run(request).await;
+    }
+    let key = request
+        .headers()
+        .get("x-affinity-client-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| (16..=100).contains(&value.len()))
+        .unwrap_or("anonymous");
+    let decision = state.rate_limiter.check(key).await;
+    if decision.allowed {
+        return next.run(request).await;
+    }
+    let request_id = Uuid::new_v4();
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error":{
+            "code":"rate_limit_exceeded",
+            "message":"Too many requests. Retry after the indicated delay.",
+            "request_id":request_id
+        }})),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, decision.retry_after_seconds.into());
+    response
 }
 
 async fn health() -> Json<Value> {
