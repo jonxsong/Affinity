@@ -12,7 +12,7 @@ An open-source recommendation platform for learning from behavior, training mode
 [![PyTorch](https://img.shields.io/badge/ML-PyTorch-ee4c2c?logo=pytorch&logoColor=white)](ml)
 [![Next.js](https://img.shields.io/badge/console-Next.js-000?logo=next.js)](apps/web)
 
-[Live console](https://affinity-recommendations.perkyaisle4.chatgpt.site) · [Architecture](docs/architecture.md) · [API](#api-surface) · [Contributing](CONTRIBUTING.md)
+[Live console](https://affinity.jonzhang.dev) · [Architecture](docs/architecture.md) · [Operations](docs/operations.md) · [API](#api-surface) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -114,6 +114,8 @@ docker compose --profile training up --build
 
 Admin mutations use `AFFINITY_ADMIN_TOKEN`; Compose supplies a development-only default. Set a strong value before exposing the API outside localhost.
 
+For an internet-facing self-hosted deployment, use the production override and follow the backup, restore, rollback, retention, incident, and rotation procedures in [`docs/operations.md`](docs/operations.md).
+
 ### Train and serve the online model
 
 The Rust API can train a compact empirical-Bayes prior from durable behavioral events, store the portable artifact transactionally, and blend it into online ranking without a Python process in the request path:
@@ -137,7 +139,7 @@ export AFFINITY_DESTINATION_TOKEN="destination-admin-token"
 cargo run --release --manifest-path services/api/Cargo.toml \
   --bin affinity-sync -- \
   --source http://localhost:8080 \
-  --destination https://affinity-recommendations.perkyaisle4.chatgpt.site \
+  --destination https://affinity.jonzhang.dev \
   --user-id usr_example \
   --client-id web_your_browser_client_id
 ```
@@ -188,6 +190,9 @@ GET  /v1/users/{id}/interests           # long-term and recent views
 GET  /v1/users/{id}/history             # paginated private history
 DELETE /v1/users/{id}                    # bearer-protected privacy deletion
 GET  /v1/recommendations/{user_id}      # explained ranked list
+GET  /v1/content                        # active production catalog
+PUT  /v1/content/{content_id}           # bearer-protected create/update
+DELETE /v1/content/{content_id}          # bearer-protected archive
 GET  /v1/content/{content_id}/similar   # vector-similar candidates
 GET  /v1/models                         # registry
 GET  /v1/models/active                  # active portable serving artifact
@@ -200,6 +205,7 @@ GET  /v1/experiments/{id}/assignment/{user_id}
 GET  /v1/overview                       # live product and service summary
 GET  /v1/sync/export/{user_id}          # bearer-protected portable event export
 POST /v1/sync/import                    # bearer-protected idempotent event import
+POST /v1/admin/maintenance              # bearer-protected retention cleanup
 GET  /health · /ready · /metrics
 ```
 
@@ -216,7 +222,7 @@ Errors use a stable envelope with `code`, `message`, and `request_id`. Recommend
 
 | Surface | Checks |
 |---|---|
-| Web | ESLint, strict TypeScript, Vitest, production static export |
+| Web | ESLint, strict TypeScript, Vitest, Chromium end-to-end flows, production static export |
 | Hosted API | Node test runner, Worker syntax check, D1 migration/deploy verification |
 | Rust | rustfmt, Clippy with warnings denied, unit/API/PostgreSQL integration tests |
 | Python | Ruff, temporal leakage, deterministic seeds, full training-artifact smoke test, model shapes |
@@ -236,12 +242,12 @@ cargo run --release --manifest-path services/api/Cargo.toml \
 
 All required checks run in [GitHub Actions](https://github.com/jonxsong/Affinity/actions/workflows/ci.yml) without paid credentials.
 
-## Known limitations
+## Scale boundaries
 
 - The active online artifact is a portable behavioral prior. SVD, two-tower, and GRU4Rec remain offline comparison models until their candidate embeddings are exported into this serving contract.
 - Redis, Qdrant, Redpanda, and MLflow are optional topology extension points, not dependencies of the current request path.
 - Hosted D1 and local PostgreSQL are separate data planes; interaction history does not automatically replicate between them.
-- No throughput or production-latency number is claimed yet.
+- The current catalog scan is intentional for the documented small-catalog deployment. Qdrant becomes required when candidate volume makes bounded in-memory scoring unsuitable.
 
 ## Roadmap
 
@@ -253,6 +259,10 @@ All required checks run in [GitHub Actions](https://github.com/jonxsong/Affinity
 - [x] Portable trained-model artifact loaded by the Rust API and hosted Worker
 - [x] Authenticated, idempotent hosted/local event synchronization
 - [x] Reproducible mixed serving benchmark with checked-in hardware metadata
+- [x] Durable public quotas, self-service deletion, retention maintenance, and browser security policy
+- [x] Authenticated content create/update/archive without an application redeploy
+- [x] Chromium release gates for the public playground and event-write paths
+- [x] Backup/restore, rollback, incident, retention, SLO, and secret-rotation runbooks
 - [ ] Qdrant export for high-cardinality learned candidate retrieval
 - [ ] MovieLens model card with repeated-seed confidence intervals
 - [ ] Repeated benchmarks across additional documented hardware

@@ -175,6 +175,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/v1/sync/export/{user_id}", get(export_user_events))
         .route("/v1/sync/import", post(import_user_events))
+        .route("/v1/admin/maintenance", post(run_maintenance))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_rate_limit,
@@ -842,6 +843,38 @@ async fn delete_user(
     Ok(Json(
         json!({"user_id":user_id,"deleted_events":deleted_events,"status":"deleted"}),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct MaintenanceRequest {
+    #[serde(default = "default_retention_days")]
+    retention_days: i64,
+}
+
+const fn default_retention_days() -> i64 {
+    365
+}
+
+async fn run_maintenance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MaintenanceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    if !(30..=3650).contains(&request.retention_days) {
+        return Err(ApiError::Validation(
+            "retention_days must be between 30 and 3650".into(),
+        ));
+    }
+    let cutoff = Utc::now() - chrono::Duration::days(request.retention_days);
+    let deleted_events = state.repository.delete_events_before(cutoff).await?;
+    Ok(Json(json!({
+        "status":"complete",
+        "retention_days":request.retention_days,
+        "deleted_events":deleted_events
+    })))
 }
 
 #[cfg(test)]

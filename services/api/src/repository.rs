@@ -54,6 +54,7 @@ pub trait Repository: Send + Sync {
     ) -> Result<Experiment, RepositoryError>;
     async fn create_training_job(&self, model_id: &str) -> Result<Uuid, RepositoryError>;
     async fn delete_user(&self, user_id: &str) -> Result<u64, RepositoryError>;
+    async fn delete_events_before(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError>;
 }
 
 #[derive(Clone)]
@@ -375,6 +376,14 @@ impl Repository for PostgresRepository {
             .await?;
         Ok(result.rows_affected())
     }
+
+    async fn delete_events_before(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
+        let result = sqlx::query("DELETE FROM events WHERE occurred_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[derive(Default)]
@@ -645,6 +654,14 @@ impl Repository for MemoryRepository {
         let mut store = self.store.write().await;
         let before = store.events.len();
         store.events.retain(|event| event.user_id != user_id);
+        store.event_ids = store.events.iter().map(|event| event.event_id).collect();
+        Ok(u64::try_from(before - store.events.len()).unwrap_or(u64::MAX))
+    }
+
+    async fn delete_events_before(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
+        let mut store = self.store.write().await;
+        let before = store.events.len();
+        store.events.retain(|event| event.timestamp >= cutoff);
         store.event_ids = store.events.iter().map(|event| event.event_id).collect();
         Ok(u64::try_from(before - store.events.len()).unwrap_or(u64::MAX))
     }

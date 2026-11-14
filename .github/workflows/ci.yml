@@ -73,9 +73,19 @@ jobs:
       - run: uv run pytest
 
   compose:
-    name: Compose config
+    name: Production containers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: cp .env.example .env
       - run: docker compose config --quiet
+      - run: docker compose -f docker-compose.production.yml config --quiet
+        env:
+          AFFINITY_ADMIN_TOKEN: ci-only-admin-token-000000000000
+          DATABASE_URL: postgres://affinity:ci-password@postgres:5432/affinity
+          POSTGRES_PASSWORD: ci-password
+      - run: docker compose -f docker-compose.production.yml build web api
+        env:
+          AFFINITY_ADMIN_TOKEN: ci-only-admin-token-000000000000
+          DATABASE_URL: postgres://affinity:ci-password@postgres:5432/affinity
+          POSTGRES_PASSWORD: ci-password
