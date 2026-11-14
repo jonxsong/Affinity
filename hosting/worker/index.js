@@ -1134,7 +1134,7 @@ function serveAsset(request, url) {
     "strict-transport-security": "max-age=31536000; includeSubDomains",
     "x-frame-options": "DENY",
     "content-security-policy":
-      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
   };
   return new Response(request.method === "HEAD" ? null : decodeAsset(asset), {
     status: notFound ? 404 : 200,
