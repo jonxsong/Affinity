@@ -5,7 +5,7 @@
   "packageManager": "pnpm@11.25.0",
   "scripts": {
     "dev": "pnpm --filter @affinity/web dev",
-    "build": "pnpm --filter @affinity/web build",
+    "build": "pnpm --filter @affinity/web build && node scripts/prepare-site.mjs",
     "lint": "pnpm --filter @affinity/web lint",
     "typecheck": "pnpm --filter @affinity/web typecheck",
     "test": "pnpm -r test",

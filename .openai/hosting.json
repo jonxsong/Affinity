@@ -1,7 +1,7 @@
 {
   "project_id": "appgprj_6af80e0780548191a52a11b3c764c3c0",
   "static": {
-    "directory": "apps/web/out"
+    "directory": "out"
   }
 }
 
