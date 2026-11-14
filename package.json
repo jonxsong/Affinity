@@ -1,0 +1,15 @@
+{
+  "name": "affinity",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev": "pnpm --filter @affinity/web dev",
+    "build": "pnpm --filter @affinity/web build",
+    "lint": "pnpm --filter @affinity/web lint",
+    "typecheck": "pnpm --filter @affinity/web typecheck",
+    "test": "pnpm -r test",
+    "format:check": "pnpm --filter @affinity/web format:check"
+  }
+}
+
