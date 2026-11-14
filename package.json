@@ -9,6 +9,7 @@
     "lint": "pnpm --filter @affinity/web lint",
     "typecheck": "pnpm --filter @affinity/web typecheck",
     "test": "pnpm -r test && pnpm test:site",
+    "test:e2e": "pnpm --filter @affinity/web test:e2e",
     "test:site": "node --test hosting/worker/index.test.mjs",
     "format:check": "pnpm --filter @affinity/web format:check"
   }
