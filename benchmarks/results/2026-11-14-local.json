@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-11-14T21:24:51.126848500Z",
+  "commit": "f9f75ae",
+  "workload": {
+    "base_url": "http://localhost:8080",
+    "requests": 1000,
+    "concurrency": 16,
+    "mix": "50% idempotent event ingestion, 50% personalized recommendation reads",
+    "successful": 1000,
+    "failed": 0
+  },
+  "results": {
+    "wall_time_ms": 242.6257,
+    "requests_per_second": 4121.5749,
+    "latency_ms": {
+      "p50": 3.1615,
+      "p95": 5.6708,
+      "p99": 24.4775,
+      "maximum": 34.6727
+    }
+  },
+  "runtime": {
+    "os": "Microsoft Windows 11 Pro",
+    "architecture": "x86_64",
+    "cpu": "AMD Ryzen 7 7800X3D 8-Core Processor",
+    "logical_cpus": 16,
+    "memory_gib": 47.2,
+    "docker_server": "29.9.3",
+    "api_profile": "release"
+  },
+  "disclaimer": "This is a measured local smoke workload on the named hardware and commit, not a universal production-capacity or latency claim."
+}
