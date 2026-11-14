@@ -5,7 +5,10 @@ COPY services/api ./services/api
 RUN cargo build --release --package affinity-api
 
 FROM debian:bookworm-slim
-RUN useradd --system --uid 10001 affinity
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 affinity
 COPY --from=builder /app/target/release/affinity-api /usr/local/bin/affinity-api
 USER affinity
 EXPOSE 8080
