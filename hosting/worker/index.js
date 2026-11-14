@@ -191,6 +191,29 @@ const EVENT_STRENGTH = {
 const CONTENT_BY_ID = new Map(CONTENT.map((item) => [item.content_id, item]));
 const STARTED_AT = Date.now();
 
+async function loadContent(db) {
+  const rows = await db
+    .prepare(
+      "SELECT content_id,title,category,description,quality_score,published_at,status FROM affinity_content_items ORDER BY published_at DESC,content_id",
+    )
+    .all();
+  const items = new Map(CONTENT.map((item) => [item.content_id, item]));
+  for (const row of rows.results || []) {
+    items.delete(row.content_id);
+    if (row.status === "active") {
+      items.set(row.content_id, {
+        content_id: row.content_id,
+        title: row.title,
+        category: row.category,
+        description: row.description,
+        quality_score: Number(row.quality_score),
+        published_at: row.published_at,
+      });
+    }
+  }
+  return [...items.values()];
+}
+
 function json(payload, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -262,8 +285,8 @@ function clamp(value, minimum, maximum, fallback) {
     : fallback;
 }
 
-function eventCategory(event) {
-  const content = event.content_id ? CONTENT_BY_ID.get(event.content_id) : null;
+function eventCategory(event, contentById = CONTENT_BY_ID) {
+  const content = event.content_id ? contentById.get(event.content_id) : null;
   if (content) return content.category;
   try {
     return JSON.parse(event.context_json || "{}").category || null;
@@ -272,12 +295,17 @@ function eventCategory(event) {
   }
 }
 
-export function calculateInterests(events, now = Date.now()) {
+export function calculateInterests(
+  events,
+  now = Date.now(),
+  content = CONTENT,
+) {
+  const contentById = new Map(content.map((item) => [item.content_id, item]));
   const totals = new Map();
   const recentTotals = new Map();
   const counts = new Map();
   for (const event of events) {
-    const category = eventCategory(event);
+    const category = eventCategory(event, contentById);
     if (!category) continue;
     const ageDays = Math.max(
       0,
@@ -309,8 +337,9 @@ export function rankContent(
   options = {},
   now = Date.now(),
   servingModel = null,
+  content = CONTENT,
 ) {
-  const interests = calculateInterests(events, now);
+  const interests = calculateInterests(events, now, content);
   const interestWeights = new Map(
     interests.long_term.map((item) => [item.topic, item.weight]),
   );
@@ -331,8 +360,9 @@ export function rankContent(
   const qualityWeight = clamp(options.quality_weight, 0, 1, 0.25);
   const diversityWeight = clamp(options.diversity_weight, 0, 1, 0.35);
   const fallbackUsed = interestWeights.size === 0;
-  const candidates = CONTENT.filter((item) => !seen.has(item.content_id)).map(
-    (item) => {
+  const candidates = content
+    .filter((item) => !seen.has(item.content_id))
+    .map((item) => {
       const relevance = interestWeights.get(item.category) || 0;
       const ageDays = Math.max(
         0,
@@ -345,8 +375,7 @@ export function rankContent(
         servingModel?.category_scores?.[item.category] ??
         0.5;
       return { ...item, relevance, recency, quality, learnedPrior };
-    },
-  );
+    });
   const selected = [];
   const categoryCounts = new Map();
   while (selected.length < limit && candidates.length) {
@@ -454,7 +483,8 @@ async function activateServingModel(db, model) {
     .run();
 }
 
-function trainServingModel(events, now = Date.now()) {
+function trainServingModel(events, now = Date.now(), content = CONTENT) {
+  const contentById = new Map(content.map((item) => [item.content_id, item]));
   const categorySignals = new Map();
   const contentSignals = new Map();
   const targets = {
@@ -477,7 +507,7 @@ function trainServingModel(events, now = Date.now()) {
     map.set(feature, signal);
   };
   for (const event of events) {
-    const content = CONTENT_BY_ID.get(event.content_id);
+    const content = contentById.get(event.content_id);
     const target = targets[event.event_type];
     if (!content || !target) continue;
     const ageDays = Math.max(
@@ -521,7 +551,7 @@ async function loadEvents(db, owner, userId, limit = 500) {
   return result.results || [];
 }
 
-function validateEvent(event) {
+function validateEvent(event, contentById = CONTENT_BY_ID) {
   const required = [
     "event_id",
     "user_id",
@@ -549,7 +579,7 @@ function validateEvent(event) {
     eventTime < Date.now() - 10 * 365 * 86_400_000
   )
     return "Event timestamp is outside the accepted retention window.";
-  if (event.content_id && !CONTENT_BY_ID.has(event.content_id))
+  if (event.content_id && !contentById.has(event.content_id))
     return "Unknown content_id.";
   return null;
 }
@@ -634,7 +664,7 @@ async function handleApi(request, env, url) {
       requestId,
     );
     if (limited) return limited;
-    const [events, users, requests, activeModel] = await Promise.all([
+    const [events, users, requests, activeModel, content] = await Promise.all([
       env.DB.prepare(
         "SELECT COUNT(*) AS count FROM affinity_events WHERE owner_id = ?",
       )
@@ -651,10 +681,11 @@ async function handleApi(request, env, url) {
         .bind(scope.owner)
         .first(),
       loadActiveModel(env.DB),
+      loadContent(env.DB),
     ]);
     return json({
       total_users: Number(users?.count || 0),
-      total_content_items: CONTENT.length,
+      total_content_items: content.length,
       total_events: Number(events?.count || 0),
       total_experiments: EXPERIMENTS.length,
       recommendation_requests: Number(requests?.value || 0),
@@ -685,7 +716,9 @@ async function handleApi(request, env, url) {
         requestId,
       );
     }
-    const validationError = validateEvent(event);
+    const content = await loadContent(env.DB);
+    const contentById = new Map(content.map((item) => [item.content_id, item]));
+    const validationError = validateEvent(event, contentById);
     if (validationError)
       return error("validation_error", validationError, 422, requestId);
     const result = await insertEvent(env.DB, scope.owner, event);
@@ -765,10 +798,13 @@ async function handleApi(request, env, url) {
         401,
         requestId,
       );
-    const rows = await env.DB.prepare(
-      "SELECT content_id,event_type,timestamp FROM affinity_events ORDER BY timestamp DESC LIMIT 100000",
-    ).all();
-    const model = trainServingModel(rows.results || []);
+    const [rows, content] = await Promise.all([
+      env.DB.prepare(
+        "SELECT content_id,event_type,timestamp FROM affinity_events ORDER BY timestamp DESC LIMIT 100000",
+      ).all(),
+      loadContent(env.DB),
+    ]);
+    const model = trainServingModel(rows.results || [], Date.now(), content);
     await activateServingModel(env.DB, model);
     return json({ status: "active", model }, 201);
   }
@@ -802,6 +838,94 @@ async function handleApi(request, env, url) {
       deleted_rate_limit_windows: Number(rateLimitResult.meta?.changes || 0),
     });
   }
+  if (url.pathname === "/v1/content" && request.method === "GET") {
+    return json({ items: await loadContent(env.DB) });
+  }
+  const contentMatch = url.pathname.match(/^\/v1\/content\/([^/]+)$/);
+  if (contentMatch && request.method === "PUT") {
+    if (!adminAuthorized(request, env))
+      return error(
+        "unauthorized",
+        "Admin authentication is required.",
+        401,
+        requestId,
+      );
+    const contentId = decodeURIComponent(contentMatch[1]);
+    const payload = await request.json().catch(() => null);
+    if (
+      !payload ||
+      !/^[a-zA-Z0-9_-]{3,120}$/.test(contentId) ||
+      typeof payload.title !== "string" ||
+      !payload.title.trim() ||
+      payload.title.length > 200 ||
+      typeof payload.category !== "string" ||
+      !/^[a-zA-Z0-9_-]{2,80}$/.test(payload.category) ||
+      typeof payload.description !== "string" ||
+      !payload.description.trim() ||
+      payload.description.length > 2000 ||
+      !Number.isFinite(payload.quality_score) ||
+      payload.quality_score < 0 ||
+      payload.quality_score > 1 ||
+      Number.isNaN(Date.parse(payload.published_at))
+    )
+      return error(
+        "validation_error",
+        "Content fields are invalid or exceed their supported limits.",
+        422,
+        requestId,
+      );
+    const item = {
+      content_id: contentId,
+      title: payload.title.trim(),
+      category: payload.category,
+      description: payload.description.trim(),
+      quality_score: Number(payload.quality_score),
+      published_at: new Date(payload.published_at).toISOString(),
+    };
+    await env.DB.prepare(
+      "INSERT INTO affinity_content_items (content_id,title,category,description,quality_score,published_at,status,updated_at) VALUES (?,?,?,?,?,?,'active',?) ON CONFLICT(content_id) DO UPDATE SET title=excluded.title,category=excluded.category,description=excluded.description,quality_score=excluded.quality_score,published_at=excluded.published_at,status='active',updated_at=excluded.updated_at",
+    )
+      .bind(
+        item.content_id,
+        item.title,
+        item.category,
+        item.description,
+        item.quality_score,
+        item.published_at,
+        new Date().toISOString(),
+      )
+      .run();
+    return json({ status: "active", item }, 200);
+  }
+  if (contentMatch && request.method === "DELETE") {
+    if (!adminAuthorized(request, env))
+      return error(
+        "unauthorized",
+        "Admin authentication is required.",
+        401,
+        requestId,
+      );
+    const contentId = decodeURIComponent(contentMatch[1]);
+    const existing = (await loadContent(env.DB)).find(
+      (item) => item.content_id === contentId,
+    );
+    if (!existing)
+      return error("not_found", "Content item not found.", 404, requestId);
+    await env.DB.prepare(
+      "INSERT INTO affinity_content_items (content_id,title,category,description,quality_score,published_at,status,updated_at) VALUES (?,?,?,?,?,?,'archived',?) ON CONFLICT(content_id) DO UPDATE SET status='archived',updated_at=excluded.updated_at",
+    )
+      .bind(
+        existing.content_id,
+        existing.title,
+        existing.category,
+        existing.description,
+        existing.quality_score,
+        existing.published_at,
+        new Date().toISOString(),
+      )
+      .run();
+    return json({ status: "archived", content_id: contentId });
+  }
   if (url.pathname === "/v1/sync/import" && request.method === "POST") {
     if (!adminAuthorized(request, env))
       return error(
@@ -826,8 +950,10 @@ async function handleApi(request, env, url) {
         requestId,
       );
     let accepted = 0;
+    const content = await loadContent(env.DB);
+    const contentById = new Map(content.map((item) => [item.content_id, item]));
     for (const event of payload.events) {
-      const validationError = validateEvent(event);
+      const validationError = validateEvent(event, contentById);
       if (validationError)
         return error("validation_error", validationError, 422, requestId);
       const result = await insertEvent(env.DB, scope.owner, event);
@@ -884,12 +1010,15 @@ async function handleApi(request, env, url) {
     );
     if (limited) return limited;
     const userId = decodeURIComponent(match[1]);
-    const events = await loadEvents(
-      env.DB,
-      scope.owner,
-      userId,
-      match[2] === "history" ? 50 : 500,
-    );
+    const [events, content] = await Promise.all([
+      loadEvents(
+        env.DB,
+        scope.owner,
+        userId,
+        match[2] === "history" ? 50 : 500,
+      ),
+      loadContent(env.DB),
+    ]);
     if (match[2] === "history") {
       return json({
         user_id: userId,
@@ -901,7 +1030,7 @@ async function handleApi(request, env, url) {
         next_cursor: null,
       });
     }
-    const interests = calculateInterests(events);
+    const interests = calculateInterests(events, Date.now(), content);
     if (match[2] === "interests") {
       return json({
         user_id: userId,
@@ -949,15 +1078,17 @@ async function handleApi(request, env, url) {
     );
     if (limited) return limited;
     const userId = decodeURIComponent(match[1]);
-    const [events, activeModel] = await Promise.all([
+    const [events, activeModel, content] = await Promise.all([
       loadEvents(env.DB, scope.owner, userId),
       loadActiveModel(env.DB),
+      loadContent(env.DB),
     ]);
     const ranked = rankContent(
       events,
       Object.fromEntries(url.searchParams),
       Date.now(),
       activeModel,
+      content,
     );
     await env.DB.prepare(
       "INSERT INTO affinity_stats (owner_id,key,value) VALUES (?,'recommendation_requests',1) ON CONFLICT(owner_id,key) DO UPDATE SET value = value + 1",

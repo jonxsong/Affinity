@@ -39,6 +39,8 @@ pub trait Repository: Send + Sync {
     ) -> Result<Vec<Event>, RepositoryError>;
     async fn all_events(&self, limit: usize) -> Result<Vec<Event>, RepositoryError>;
     async fn all_content(&self) -> Result<Vec<ContentItem>, RepositoryError>;
+    async fn upsert_content(&self, item: &ContentItem) -> Result<(), RepositoryError>;
+    async fn archive_content(&self, content_id: &str) -> Result<bool, RepositoryError>;
     async fn overview(&self) -> Result<OverviewStats, RepositoryError>;
     async fn models(&self) -> Result<Vec<ModelVersion>, RepositoryError>;
     async fn model(&self, id: &str) -> Result<Option<ModelVersion>, RepositoryError>;
@@ -203,11 +205,39 @@ impl Repository for PostgresRepository {
 
     async fn all_content(&self) -> Result<Vec<ContentItem>, RepositoryError> {
         let rows = sqlx::query(
-            "SELECT content_id,title,category,description,quality_score,published_at,metadata FROM content_items ORDER BY content_id",
+            "SELECT content_id,title,category,description,quality_score,published_at,metadata FROM content_items WHERE status='active' ORDER BY content_id",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::content_from_row).collect()
+    }
+
+    async fn upsert_content(&self, item: &ContentItem) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO content_items (content_id,title,category,description,quality_score,published_at,metadata,status,updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'active',now()) \
+             ON CONFLICT (content_id) DO UPDATE SET title=EXCLUDED.title,category=EXCLUDED.category,description=EXCLUDED.description,quality_score=EXCLUDED.quality_score,published_at=EXCLUDED.published_at,metadata=EXCLUDED.metadata,status='active',updated_at=now()",
+        )
+        .bind(&item.content_id)
+        .bind(&item.title)
+        .bind(&item.category)
+        .bind(&item.description)
+        .bind(item.quality_score)
+        .bind(item.published_at)
+        .bind(&item.metadata)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn archive_content(&self, content_id: &str) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE content_items SET status='archived',updated_at=now() WHERE content_id=$1 AND status='active'",
+        )
+        .bind(content_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn overview(&self) -> Result<OverviewStats, RepositoryError> {
@@ -480,6 +510,27 @@ impl Repository for MemoryRepository {
 
     async fn all_content(&self) -> Result<Vec<ContentItem>, RepositoryError> {
         Ok(self.store.read().await.content.clone())
+    }
+
+    async fn upsert_content(&self, item: &ContentItem) -> Result<(), RepositoryError> {
+        let mut store = self.store.write().await;
+        if let Some(existing) = store
+            .content
+            .iter_mut()
+            .find(|existing| existing.content_id == item.content_id)
+        {
+            *existing = item.clone();
+        } else {
+            store.content.push(item.clone());
+        }
+        Ok(())
+    }
+
+    async fn archive_content(&self, content_id: &str) -> Result<bool, RepositoryError> {
+        let mut store = self.store.write().await;
+        let before = store.content.len();
+        store.content.retain(|item| item.content_id != content_id);
+        Ok(store.content.len() != before)
     }
 
     async fn overview(&self) -> Result<OverviewStats, RepositoryError> {

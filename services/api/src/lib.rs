@@ -152,6 +152,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/users/{id}/history", get(get_history))
         .route("/v1/recommendations/{user_id}", get(get_recommendations))
         .route("/v1/content", get(get_content))
+        .route(
+            "/v1/content/{content_id}",
+            axum::routing::put(upsert_content).delete(archive_content),
+        )
         .route("/v1/content/{content_id}/similar", get(get_similar))
         .route("/v1/models", get(get_models))
         .route(
@@ -503,6 +507,40 @@ async fn get_recommendations(
 
 async fn get_content(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({"items":state.repository.all_content().await?})))
+}
+
+async fn upsert_content(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+    headers: HeaderMap,
+    Json(mut item): Json<ContentItem>,
+) -> Result<Json<Value>, ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    if item.content_id != content_id {
+        return Err(ApiError::Validation(
+            "path content_id must match the request body".into(),
+        ));
+    }
+    item.content_id = content_id;
+    item.validate().map_err(ApiError::Validation)?;
+    state.repository.upsert_content(&item).await?;
+    Ok(Json(json!({"status":"active","item":item})))
+}
+
+async fn archive_content(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    if !state.repository.archive_content(&content_id).await? {
+        return Err(ApiError::NotFound("content".into()));
+    }
+    Ok(Json(json!({"status":"archived","content_id":content_id})))
 }
 
 async fn get_similar(
@@ -890,6 +928,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn content_lifecycle_is_authenticated_and_immediately_queryable() {
+        let app = app(AppState::test("secret"));
+        let item = ContentItem {
+            content_id: "item_runtime".into(),
+            title: "Runtime-managed content".into(),
+            category: "operations".into(),
+            description: "A content item managed without redeploying the API.".into(),
+            quality_score: 0.91,
+            published_at: Utc::now(),
+            metadata: json!({"source":"test"}),
+        };
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::put("/v1/content/item_runtime")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&item).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let upserted = app
+            .clone()
+            .oneshot(
+                Request::put("/v1/content/item_runtime")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&item).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upserted.status(), StatusCode::OK);
+
+        let listed = app
+            .clone()
+            .oneshot(Request::get("/v1/content").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = listed.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["content_id"] == "item_runtime"));
+
+        let archived = app
+            .oneshot(
+                Request::delete("/v1/content/item_runtime")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archived.status(), StatusCode::OK);
     }
 
     #[tokio::test]

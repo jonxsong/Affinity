@@ -100,6 +100,39 @@ pub struct ContentItem {
     pub metadata: Value,
 }
 
+impl ContentItem {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value, limit) in [
+            ("content_id", self.content_id.as_str(), 120),
+            ("title", self.title.as_str(), 200),
+            ("category", self.category.as_str(), 80),
+            ("description", self.description.as_str(), 2_000),
+        ] {
+            if value.trim().is_empty() || value.len() > limit {
+                return Err(format!(
+                    "{name} must contain between 1 and {limit} characters"
+                ));
+            }
+        }
+        if !self
+            .content_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        {
+            return Err(
+                "content_id may contain only letters, numbers, underscores, and hyphens".into(),
+            );
+        }
+        if !self.quality_score.is_finite() || !(0.0..=1.0).contains(&self.quality_score) {
+            return Err("quality_score must be between 0 and 1".into());
+        }
+        if !self.metadata.is_object() {
+            return Err("metadata must be a JSON object".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experiment {
     pub id: Uuid,
