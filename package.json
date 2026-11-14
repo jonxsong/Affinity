@@ -5,11 +5,11 @@
   "packageManager": "pnpm@11.25.0",
   "scripts": {
     "dev": "pnpm --filter @affinity/web dev",
-    "build": "pnpm --filter @affinity/web build && node scripts/prepare-site.mjs",
+    "build": "pnpm --filter @affinity/web build && node scripts/prepare-site.mjs && node scripts/build-site-worker.mjs",
     "lint": "pnpm --filter @affinity/web lint",
     "typecheck": "pnpm --filter @affinity/web typecheck",
-    "test": "pnpm -r test",
+    "test": "pnpm -r test && pnpm test:site",
+    "test:site": "node --test hosting/worker/index.test.mjs",
     "format:check": "pnpm --filter @affinity/web format:check"
   }
 }
-

@@ -26,6 +26,7 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm --filter @affinity/web test
+      - run: pnpm test:site
       - run: pnpm build
 
   api:
@@ -76,4 +77,3 @@ jobs:
       - uses: actions/checkout@v4
       - run: cp .env.example .env
       - run: docker compose config --quiet
-

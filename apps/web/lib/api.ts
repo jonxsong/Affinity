@@ -1,8 +1,9 @@
 import { z } from "zod";
 
 export const apiBaseUrl =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ||
-  "http://localhost:8080";
+  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || "";
+
+export const apiLocationLabel = apiBaseUrl || "this site";
 
 const healthSchema = z.object({
   status: z.string(),

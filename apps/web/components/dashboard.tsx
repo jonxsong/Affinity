@@ -53,7 +53,7 @@ import {
   users,
   type NavId,
 } from "@/lib/demo-data";
-import { api, apiBaseUrl } from "@/lib/api";
+import { api, apiLocationLabel } from "@/lib/api";
 
 const nav: { id: NavId; label: string; icon: typeof Activity }[] = [
   { id: "overview", label: "Overview", icon: ChartNoAxesCombined },
@@ -110,8 +110,8 @@ function DemoNotice() {
       <CircleDot size={14} />
       <span>
         {live
-          ? `Live API connected at ${apiBaseUrl}. Actions update durable application state.`
-          : `API unavailable at ${apiBaseUrl}. Showing labeled showcase data until the local stack connects.`}
+          ? `Live API connected at ${apiLocationLabel}. Actions update durable application state.`
+          : `API unavailable at ${apiLocationLabel}. Showing labeled showcase data while the connection recovers.`}
       </span>
     </div>
   );
@@ -134,8 +134,8 @@ function EventComposer() {
         <div>
           <h3>Ingest a behavioral event</h3>
           <p>
-            Writes through the versioned Rust API and immediately updates this
-            user&apos;s representation.
+            Writes through the versioned Affinity API and immediately updates
+            this user&apos;s representation.
           </p>
         </div>
         <Badge tone={mutation.isSuccess ? "green" : "muted"}>
@@ -191,7 +191,7 @@ function EventComposer() {
   );
 }
 
-function Overview() {
+function Overview({ onOpenPlayground }: { onOpenPlayground: () => void }) {
   const overview = useQuery({
     queryKey: ["overview"],
     queryFn: api.overview,
@@ -233,7 +233,7 @@ function Overview() {
         title="Recommendation intelligence"
         detail="One place to understand behavior, inspect representations, and debug every ranked result."
         action={
-          <button className="button primary">
+          <button className="button primary" onClick={onOpenPlayground}>
             <Play size={15} fill="currentColor" /> Run playground
           </button>
         }
@@ -326,9 +326,12 @@ function Overview() {
           <div className="service-list">
             {(overview.isSuccess
               ? [
-                  { name: "Rust API", status: "live", note: "Connected" },
+                  { name: "Affinity API", status: "live", note: "Connected" },
                   {
-                    name: "PostgreSQL",
+                    name:
+                      overview.data.storage === "d1"
+                        ? "Cloudflare D1"
+                        : "PostgreSQL",
                     status: "live",
                     note: "Durable events",
                   },
@@ -1265,8 +1268,7 @@ function Observability() {
   );
 }
 
-const pages: Record<NavId, () => React.JSX.Element> = {
-  overview: Overview,
+const pages: Record<Exclude<NavId, "overview">, () => React.JSX.Element> = {
   users: UserExplorer,
   embeddings: Embeddings,
   playground: Playground,
@@ -1278,7 +1280,7 @@ const pages: Record<NavId, () => React.JSX.Element> = {
 export function Dashboard() {
   const [active, setActive] = useState<NavId>("overview");
   const [mobile, setMobile] = useState(false);
-  const Page = pages[active];
+  const Page = active === "overview" ? null : pages[active];
   const health = useQuery({
     queryKey: ["health"],
     queryFn: api.health,
@@ -1382,13 +1384,17 @@ export function Dashboard() {
           </div>
         </header>
         <div className="content">
-          <Page />
+          {Page ? (
+            <Page />
+          ) : (
+            <Overview onOpenPlayground={() => setActive("playground")} />
+          )}
         </div>
         <footer>
           <span>Affinity · open-source recommendation intelligence</span>
           <span>
             {health.isSuccess
-              ? `Connected to ${apiBaseUrl}`
+              ? `Connected to ${apiLocationLabel}`
               : "Public and synthetic showcase data is labeled"}
           </span>
         </footer>
