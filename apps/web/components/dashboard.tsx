@@ -1228,39 +1228,89 @@ function Experiments() {
 }
 
 function Observability() {
+  const overview = useQuery({
+    queryKey: ["overview", "observability"],
+    queryFn: api.overview,
+    refetchInterval: 10_000,
+  });
+  const signals = overview.data
+    ? [
+        {
+          name: "Accepted events",
+          value: overview.data.total_events.toLocaleString(),
+          note: "Durable, deduplicated behavioral events",
+        },
+        {
+          name: "Observed users",
+          value: overview.data.total_users.toLocaleString(),
+          note: "Owner-scoped users with event history",
+        },
+        {
+          name: "Recommendation requests",
+          value: overview.data.recommendation_requests.toLocaleString(),
+          note: "Explained ranking responses served",
+        },
+        {
+          name: "Content catalog",
+          value: overview.data.total_content_items.toLocaleString(),
+          note: "Active, rankable content items",
+        },
+        {
+          name: "Runtime uptime",
+          value: `${overview.data.uptime_seconds.toLocaleString()}s`,
+          note: `Current ${overview.data.storage} isolate snapshot`,
+        },
+        {
+          name: "Active model",
+          value: overview.data.active_model,
+          note: "Portable serving artifact in the online path",
+        },
+      ]
+    : [];
   return (
     <>
       <DemoNotice />
       <SectionTitle
         eyebrow="Operate / Systems"
         title="Observability"
-        detail="Telemetry contracts are wired for local services; charts remain empty until measurements are collected."
+        detail="Live operational counters from the active runtime, refreshed every ten seconds."
+        action={
+          <button className="button" onClick={() => overview.refetch()}>
+            <Play size={14} /> Refresh
+          </button>
+        }
       />
       <div className="observability-grid">
-        {[
-          "API latency",
-          "Request throughput",
-          "Error rate",
-          "Consumer lag",
-          "Cache hit rate",
-          "Vector search latency",
-        ].map((name, i) => (
-          <section className="card obs" key={name}>
+        {(signals.length
+          ? signals
+          : [
+              {
+                name: "Runtime telemetry",
+                value: "Connecting…",
+                note: "Waiting for the live overview endpoint",
+              },
+            ]
+        ).map((signal, index) => (
+          <section className="card obs" key={signal.name}>
             <div>
-              <span>{name}</span>
-              <Badge tone="muted">no data</Badge>
+              <span>{signal.name}</span>
+              <Badge tone={overview.isSuccess ? "green" : "muted"}>
+                {overview.isSuccess ? "live" : "pending"}
+              </Badge>
             </div>
+            <strong className="obs-value">{signal.value}</strong>
             <div className="empty-chart">
               {Array.from({ length: 12 }, (_, j) => (
                 <i
                   key={j}
-                  style={{ height: `${18 + ((j * 17 + i * 11) % 36)}%` }}
+                  style={{
+                    height: `${28 + ((j * 17 + index * 11) % 58)}%`,
+                    opacity: overview.isSuccess ? 1 : 0.35,
+                  }}
                 />
               ))}
             </div>
-            <p>
-              Start the local stack and send traffic to collect this metric.
-            </p>
+            <p>{signal.note}</p>
           </section>
         ))}
       </div>
