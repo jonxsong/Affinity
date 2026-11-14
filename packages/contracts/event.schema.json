@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://affinity.local/contracts/event-v1.schema.json",
+  "title": "Affinity behavioral event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "user_id", "event_type", "timestamp", "session_id", "surface", "schema_version"],
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid" },
+    "user_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "content_id": { "type": ["string", "null"], "maxLength": 200 },
+    "event_type": {
+      "enum": ["content_impression", "content_view", "click", "like", "save", "share", "search", "dismiss", "follow", "dwell_time", "recommendation_conversion"]
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "context": { "type": "object" },
+    "surface": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "schema_version": { "const": 1 }
+  }
+}
+
