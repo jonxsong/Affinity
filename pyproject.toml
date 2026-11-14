@@ -9,6 +9,7 @@ dependencies = [
   "numpy>=2.1.3",
   "polars>=1.12.0",
   "pydantic>=2.9.2",
+  "psycopg[binary]>=3.2.3",
   "scikit-learn>=1.5.2",
   "sentence-transformers>=3.2.1",
   "torch>=2.5.1",
@@ -16,6 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3.3", "pytest-cov>=6.0.0", "ruff>=0.7.3"]
+
+[project.scripts]
+affinity-seed = "affinity_ml.datasets.seed:main"
+affinity-train = "affinity_ml.training.pipeline:main"
+affinity-worker = "affinity_ml.training.worker:main"
 
 [build-system]
 requires = ["hatchling"]

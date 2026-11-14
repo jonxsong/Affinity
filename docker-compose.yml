@@ -16,11 +16,13 @@ services:
       context: .
       dockerfile: services/api/Dockerfile
     ports: ["8080:8080"]
-    env_file: [.env]
     environment:
+      AFFINITY_API_ADDR: 0.0.0.0:8080
+      AFFINITY_ADMIN_TOKEN: ${AFFINITY_ADMIN_TOKEN:-local-development-only}
       DATABASE_URL: postgres://affinity:affinity@postgres:5432/affinity
       REDIS_URL: redis://redis:6379
       QDRANT_URL: http://qdrant:6333
+      RUST_LOG: ${RUST_LOG:-affinity_api=info,tower_http=info}
     depends_on:
       postgres: { condition: service_healthy }
     healthcheck:
@@ -35,8 +37,23 @@ services:
       dockerfile: services/ml-service/Dockerfile
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      DATABASE_URL: postgres://affinity:affinity@postgres:5432/affinity
+      AFFINITY_API_URL: http://api:8080
     volumes:
       - ./artifacts:/app/artifacts
+    profiles: ["training"]
+
+  ml-worker:
+    build:
+      context: .
+      dockerfile: services/ml-service/Dockerfile
+    command: python -m affinity_ml.training.worker
+    environment:
+      DATABASE_URL: postgres://affinity:affinity@postgres:5432/affinity
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      postgres: { condition: service_healthy }
     profiles: ["training"]
 
   postgres:
