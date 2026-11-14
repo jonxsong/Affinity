@@ -1290,10 +1290,10 @@ export function Dashboard() {
         <div className="brand">
           <Image
             className="brand-logo"
-            src="/affinity-logo.png"
+            src="/affinity-logo.svg"
             alt="Affinity"
-            width={101}
-            height={36}
+            width={202}
+            height={72}
             priority
           />
           <Badge tone="muted">beta</Badge>

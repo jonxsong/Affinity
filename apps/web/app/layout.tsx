@@ -11,8 +11,8 @@ export const metadata: Metadata = {
   description:
     "Inspect user representations, compare recommenders, and understand every ranked result.",
   icons: {
-    icon: "/affinity-logo.png",
-    shortcut: "/affinity-logo.png",
+    icon: "/affinity-mark.svg",
+    shortcut: "/affinity-mark.svg",
   },
 };
 

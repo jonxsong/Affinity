@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/affinity-logo.png" alt="Affinity" width="202" />
+<img src="docs/assets/affinity-logo.svg" alt="Affinity" width="202" />
 
 ### Understand users. Personalize everything.
 
