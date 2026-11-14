@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="850" viewBox="0 0 1400 850" role="img" aria-labelledby="title desc">
+  <title id="title">Affinity system architecture</title>
+  <desc id="desc">Behavioral events enter a Rust API, flow through durable data infrastructure into Python model training, and return through a multi-stage ranking pipeline to the developer console.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#323232"/></marker>
+    <filter id="wobble"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="7" result="noise"/><feDisplacementMap in="SourceGraphic" in2="noise" scale="1.1"/></filter>
+    <style>
+      .bg{fill:#fffdf8}.box{stroke:#292929;stroke-width:2;filter:url(#wobble)}.shadow{fill:none;stroke:#292929;stroke-width:1;opacity:.3}.title{font:700 23px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#202020}.label{font:600 17px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#202020}.small{font:13px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#565656}.tiny{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#626262}.line{fill:none;stroke:#323232;stroke-width:2;stroke-linecap:round;marker-end:url(#arrow);filter:url(#wobble)}.dash{stroke-dasharray:8 7}.group{fill:none;stroke:#9b9b9b;stroke-width:1.5;stroke-dasharray:7 7;rx:20}.group-label{font:700 12px ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:1.5px;fill:#777;text-transform:uppercase}
+    </style>
+  </defs>
+  <rect class="bg" width="1400" height="850" rx="18"/>
+  <text x="54" y="54" class="title">AFFINITY / learning loop</text>
+  <text x="54" y="80" class="small">observed behavior → representations → candidates → explained ranking</text>
+
+  <rect x="35" y="115" width="290" height="675" class="group"/>
+  <text x="55" y="141" class="group-label">experience</text>
+  <rect x="70" y="178" width="220" height="92" rx="13" fill="#e8f7ef" class="box"/><rect x="74" y="182" width="220" height="92" rx="13" class="shadow"/>
+  <text x="95" y="216" class="label">Next.js console</text><text x="95" y="242" class="small">explore · compare · debug</text>
+  <rect x="70" y="331" width="220" height="90" rx="13" fill="#eeeafa" class="box"/><rect x="74" y="335" width="220" height="90" rx="13" class="shadow"/>
+  <text x="95" y="368" class="label">SDKs / clients</text><text x="95" y="394" class="small">events + recommend calls</text>
+  <rect x="70" y="566" width="220" height="102" rx="13" fill="#fff2d8" class="box"/><rect x="74" y="570" width="220" height="102" rx="13" class="shadow"/>
+  <text x="95" y="604" class="label">Ranked results</text><text x="95" y="630" class="small">scores + explanations</text><text x="95" y="650" class="tiny">model version attached</text>
+
+  <rect x="362" y="115" width="365" height="675" class="group"/>
+  <text x="382" y="141" class="group-label">online path · rust</text>
+  <rect x="403" y="178" width="280" height="92" rx="13" fill="#dff3ff" class="box"/><rect x="407" y="182" width="280" height="92" rx="13" class="shadow"/>
+  <text x="428" y="215" class="label">Axum API gateway</text><text x="428" y="240" class="small">validate · trace · authorize</text>
+  <rect x="403" y="331" width="280" height="90" rx="13" fill="#dff3ff" class="box"/><rect x="407" y="335" width="280" height="90" rx="13" class="shadow"/>
+  <text x="428" y="368" class="label">Event ingestion</text><text x="428" y="393" class="small">dedupe · batch · dead letter</text>
+  <rect x="403" y="566" width="280" height="102" rx="13" fill="#dff3ff" class="box"/><rect x="407" y="570" width="280" height="102" rx="13" class="shadow"/>
+  <text x="428" y="603" class="label">Ranking policy</text><text x="428" y="628" class="small">filter · score · diversify</text><text x="428" y="649" class="tiny">popularity fallback</text>
+
+  <rect x="765" y="115" width="260" height="675" class="group"/>
+  <text x="785" y="141" class="group-label">state</text>
+  <rect x="803" y="178" width="184" height="78" rx="13" fill="#ffe9e1" class="box"/><text x="830" y="212" class="label">Redpanda</text><text x="830" y="235" class="small">event log</text>
+  <rect x="803" y="305" width="184" height="78" rx="13" fill="#e8f7ef" class="box"/><text x="830" y="339" class="label">PostgreSQL</text><text x="830" y="362" class="small">durable records</text>
+  <rect x="803" y="432" width="184" height="78" rx="13" fill="#fff2d8" class="box"/><text x="830" y="466" class="label">Redis</text><text x="830" y="489" class="small">feature cache</text>
+  <rect x="803" y="559" width="184" height="78" rx="13" fill="#eeeafa" class="box"/><text x="830" y="593" class="label">Qdrant</text><text x="830" y="616" class="small">item vectors</text>
+  <rect x="803" y="686" width="184" height="64" rx="13" fill="#f0f0f0" class="box"/><text x="830" y="724" class="label">MLflow</text>
+
+  <rect x="1060" y="115" width="305" height="675" class="group"/>
+  <text x="1080" y="141" class="group-label">offline path · python</text>
+  <rect x="1100" y="178" width="225" height="90" rx="13" fill="#fff2d8" class="box"/><rect x="1104" y="182" width="225" height="90" rx="13" class="shadow"/>
+  <text x="1125" y="214" class="label">Event consumer</text><text x="1125" y="239" class="small">recoverable offsets</text>
+  <rect x="1100" y="331" width="225" height="90" rx="13" fill="#fff2d8" class="box"/><rect x="1104" y="335" width="225" height="90" rx="13" class="shadow"/>
+  <text x="1125" y="367" class="label">Feature pipeline</text><text x="1125" y="392" class="small">temporal · recency aware</text>
+  <rect x="1100" y="484" width="225" height="105" rx="13" fill="#eeeafa" class="box"/><rect x="1104" y="488" width="225" height="105" rx="13" class="shadow"/>
+  <text x="1125" y="519" class="label">Model training</text><text x="1125" y="544" class="small">SVD · two tower</text><text x="1125" y="566" class="small">GRU4Rec · popularity</text>
+  <rect x="1100" y="651" width="225" height="87" rx="13" fill="#e8f7ef" class="box"/><rect x="1104" y="655" width="225" height="87" rx="13" class="shadow"/>
+  <text x="1125" y="686" class="label">Evaluation</text><text x="1125" y="711" class="small">temporal holdout</text>
+
+  <path d="M290 224 C337 224 355 224 403 224" class="line"/><text x="329" y="211" class="tiny">HTTP</text>
+  <path d="M290 376 C340 376 355 376 403 376" class="line"/>
+  <path d="M543 270 C543 292 543 306 543 331" class="line"/>
+  <path d="M683 376 C735 376 757 217 803 217" class="line"/>
+  <path d="M987 217 C1035 217 1055 223 1100 223" class="line"/>
+  <path d="M1212 268 C1212 291 1212 307 1212 331" class="line"/>
+  <path d="M1212 421 C1212 447 1212 458 1212 484" class="line"/>
+  <path d="M1100 375 C1050 375 1031 344 987 344" class="line dash"/>
+  <path d="M1100 536 C1047 536 1032 598 987 598" class="line"/><text x="1018" y="576" class="tiny">embeddings</text>
+  <path d="M1212 589 C1212 613 1212 627 1212 651" class="line"/>
+  <path d="M1100 694 C1050 694 1030 718 987 718" class="line"/>
+  <path d="M803 471 C750 471 721 617 683 617" class="line"/>
+  <path d="M803 598 C758 598 730 598 683 598" class="line"/>
+  <path d="M403 617 C355 617 338 617 290 617" class="line"/>
+  <path d="M543 566 C543 507 543 487 543 421" class="line dash"/><text x="557" y="498" class="tiny">feedback</text>
+
+  <path d="M50 812 C210 802 330 819 495 810 S770 816 930 808 S1180 816 1350 807" fill="none" stroke="#9df7d2" stroke-width="4" stroke-linecap="round" opacity=".8" filter="url(#wobble)"/>
+</svg>
+
