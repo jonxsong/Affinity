@@ -1,102 +1,215 @@
+mod domain;
+mod ranking;
+mod repository;
+
+pub use domain::{ContentItem, Event, EventType, Experiment, ModelVersion, Recommendation};
+pub use repository::{MemoryRepository, PostgresRepository, Repository};
+
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
+use domain::IngestStatus;
+use ranking::{interests, recommend, RankingOptions};
+use repository::{arc, NewExperiment, RepositoryError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
 use tower_http::{
-    cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer,
+    cors::{Any, CorsLayer},
+    limit::RequestBodyLimitLayer,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
 };
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
-    inner: Arc<RwLock<Store>>,
+    repository: Arc<dyn Repository>,
     admin_token: Arc<str>,
-}
-
-#[derive(Default)]
-struct Store {
-    event_ids: HashSet<Uuid>,
-    events: Vec<Event>,
-    experiments: Vec<Experiment>,
+    recommendation_requests: Arc<AtomicU64>,
+    started_at: Instant,
 }
 
 impl AppState {
-    pub fn demo(admin_token: String) -> Self {
+    pub async fn connect(database_url: &str, admin_token: String) -> Result<Self, RepositoryError> {
+        let repository = PostgresRepository::connect(database_url).await?;
+        Ok(Self::new(arc(repository), admin_token))
+    }
+
+    pub fn test(admin_token: impl Into<String>) -> Self {
+        Self::new(arc(MemoryRepository::fixture()), admin_token.into())
+    }
+
+    pub fn new(repository: Arc<dyn Repository>, admin_token: String) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Store::default())),
+            repository,
             admin_token: admin_token.into(),
+            recommendation_requests: Arc::new(AtomicU64::new(0)),
+            started_at: Instant::now(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum EventType {
-    ContentImpression,
-    ContentView,
-    Click,
-    Like,
-    Save,
-    Share,
-    Search,
-    Dismiss,
-    Follow,
-    DwellTime,
-    RecommendationConversion,
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("{0}")]
+    Validation(String),
+    #[error("authentication is required for this operation")]
+    Unauthorized,
+    #[error("{0} was not found")]
+    NotFound(String),
+    #[error("a resource with the same identity already exists")]
+    Conflict,
+    #[error("the service could not complete the request")]
+    Internal(#[source] RepositoryError),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub event_id: Uuid,
-    pub user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_id: Option<String>,
-    pub event_type: EventType,
-    pub timestamp: DateTime<Utc>,
-    pub session_id: String,
-    #[serde(default)]
-    pub context: HashMap<String, Value>,
-    pub surface: String,
-    #[serde(default = "schema_v1")]
-    pub schema_version: u16,
-}
-
-fn schema_v1() -> u16 {
-    1
-}
-
-impl Event {
-    fn validate(&self) -> Result<(), ApiError> {
-        if self.user_id.trim().is_empty()
-            || self.session_id.trim().is_empty()
-            || self.surface.trim().is_empty()
-        {
-            return Err(ApiError::validation(
-                "user_id, session_id, and surface must be non-empty",
-            ));
+impl From<RepositoryError> for ApiError {
+    fn from(error: RepositoryError) -> Self {
+        match &error {
+            RepositoryError::Database(sqlx::Error::Database(database))
+                if database.is_unique_violation() =>
+            {
+                Self::Conflict
+            }
+            _ => Self::Internal(error),
         }
-        if self.schema_version != 1 {
-            return Err(ApiError::validation(
-                "only event schema_version=1 is supported",
-            ));
-        }
-        if self.timestamp > Utc::now() + chrono::Duration::minutes(5) {
-            return Err(ApiError::validation("timestamp is too far in the future"));
-        }
-        Ok(())
     }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let request_id = Uuid::new_v4();
+        let (status, code, public_message) = match self {
+            Self::Validation(message) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                message,
+            ),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "authentication is required for this operation".into(),
+            ),
+            Self::NotFound(resource) => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("{resource} was not found"),
+            ),
+            Self::Conflict => (
+                StatusCode::CONFLICT,
+                "conflict",
+                "a resource with the same identity already exists".into(),
+            ),
+            Self::Internal(error) => {
+                tracing::error!(%request_id, error = ?error, "request failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "the service could not complete the request".into(),
+                )
+            }
+        };
+        (
+            status,
+            Json(json!({"error":{"code":code,"message":public_message,"request_id":request_id}})),
+        )
+            .into_response()
+    }
+}
+
+pub fn app(state: AppState) -> Router {
+    let request_id_header = HeaderName::from_static("x-request-id");
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .route("/v1/overview", get(overview))
+        .route("/v1/events", post(ingest_event))
+        .route("/v1/events/batch", post(ingest_batch))
+        .route("/v1/users/{id}", get(get_user).delete(delete_user))
+        .route("/v1/users/{id}/interests", get(get_interests))
+        .route("/v1/users/{id}/history", get(get_history))
+        .route("/v1/recommendations/{user_id}", get(get_recommendations))
+        .route("/v1/content", get(get_content))
+        .route("/v1/content/{content_id}/similar", get(get_similar))
+        .route("/v1/models", get(get_models))
+        .route("/v1/models/{id}/metrics", get(get_model_metrics))
+        .route("/v1/models/train", post(start_training))
+        .route(
+            "/v1/experiments",
+            get(get_experiments).post(create_experiment),
+        )
+        .route(
+            "/v1/experiments/{id}/assignment/{user_id}",
+            get(get_assignment),
+        )
+        .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
+        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+        .layer(TraceLayer::new_for_http())
+        .layer(RequestBodyLimitLayer::new(1_048_576))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(10),
+        ))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+        )
+        .with_state(state)
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({"status":"ok","service":"affinity-api","version":env!("CARGO_PKG_VERSION")}))
+}
+
+async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    state.repository.health().await?;
+    Ok(Json(json!({
+        "status":"ready",
+        "dependencies":{"repository":state.repository.kind()},
+        "version":env!("CARGO_PKG_VERSION")
+    })))
+}
+
+async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let statistics = state.repository.overview().await?;
+    Ok(Json(json!({
+        "total_users":statistics.total_users,
+        "total_content_items":statistics.total_content_items,
+        "total_events":statistics.total_events,
+        "total_experiments":statistics.total_experiments,
+        "recommendation_requests":state.recommendation_requests.load(Ordering::Relaxed),
+        "storage":state.repository.kind(),
+        "uptime_seconds":state.started_at.elapsed().as_secs(),
+        "active_model":"affinity-ranker-v1"
+    })))
+}
+
+async fn metrics(State(state): State<AppState>) -> Result<String, ApiError> {
+    let statistics = state.repository.overview().await?;
+    Ok(format!(
+        "# HELP affinity_events_total Accepted unique events\n# TYPE affinity_events_total gauge\naffinity_events_total {}\n\
+         # HELP affinity_users_total Users with observed behavior\n# TYPE affinity_users_total gauge\naffinity_users_total {}\n\
+         # HELP affinity_recommendation_requests_total Recommendation requests served\n# TYPE affinity_recommendation_requests_total counter\naffinity_recommendation_requests_total {}\n",
+        statistics.total_events,
+        statistics.total_users,
+        state.recommendation_requests.load(Ordering::Relaxed)
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -105,9 +218,38 @@ struct IngestResult {
     status: &'static str,
 }
 
+async fn ingest_event(
+    State(state): State<AppState>,
+    Json(event): Json<Event>,
+) -> Result<(StatusCode, Json<IngestResult>), ApiError> {
+    event.validate(Utc::now()).map_err(ApiError::Validation)?;
+    let status = state
+        .repository
+        .ingest(std::slice::from_ref(&event))
+        .await?[0];
+    let http_status = match status {
+        IngestStatus::Accepted => StatusCode::ACCEPTED,
+        IngestStatus::Duplicate => StatusCode::OK,
+    };
+    Ok((
+        http_status,
+        Json(IngestResult {
+            event_id: event.event_id,
+            status: status.as_str(),
+        }),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct EventBatch {
     events: Vec<Event>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchError {
+    index: usize,
+    code: &'static str,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,374 +260,363 @@ struct BatchResult {
     errors: Vec<BatchError>,
 }
 
-#[derive(Debug, Serialize)]
-struct BatchError {
-    index: usize,
-    code: &'static str,
-    message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Recommendation {
-    content_id: String,
-    title: String,
-    category: String,
-    score: f32,
-    score_type: &'static str,
-    components: ScoreComponents,
-    explanation: String,
-    model_version: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ScoreComponents {
-    relevance: f32,
-    recency: f32,
-    diversity: f32,
-    quality: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct RecommendationQuery {
-    #[serde(default = "default_limit")]
-    limit: usize,
-    #[serde(default)]
-    strategy: Option<String>,
-}
-fn default_limit() -> usize {
-    10
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Experiment {
-    id: String,
-    name: String,
-    control: String,
-    treatment: String,
-    allocation: f32,
-    status: String,
-}
-
-#[derive(Debug, Serialize)]
-struct UserProfile {
-    user_id: String,
-    representation: &'static str,
-    observed_event_count: usize,
-    profile_version: u8,
-    inferred_sensitive_attributes: Vec<String>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ApiError {
-    #[error("{message}")]
-    Validation { message: String },
-    #[error("unauthorized")]
-    Unauthorized,
-    #[error("not found")]
-    NotFound,
-}
-
-impl ApiError {
-    fn validation(message: impl Into<String>) -> Self {
-        Self::Validation {
-            message: message.into(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let message = self.to_string();
-        let (status, code) = match self {
-            Self::Validation { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "validation_error"),
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-        };
-        let body = Json(
-            json!({ "error": { "code": code, "message": message, "request_id": Uuid::new_v4() } }),
-        );
-        (status, body).into_response()
-    }
-}
-
-pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics))
-        .route("/v1/events", post(ingest_event))
-        .route("/v1/events/batch", post(ingest_batch))
-        .route("/v1/users/{id}", get(get_user))
-        .route("/v1/users/{id}/interests", get(get_interests))
-        .route("/v1/users/{id}/history", get(get_history))
-        .route("/v1/recommendations/{user_id}", get(get_recommendations))
-        .route("/v1/content/{content_id}/similar", get(get_similar))
-        .route("/v1/models", get(get_models))
-        .route("/v1/models/{id}/metrics", get(get_model_metrics))
-        .route("/v1/models/train", post(start_training))
-        .route(
-            "/v1/experiments",
-            get(get_experiments).post(create_experiment),
-        )
-        .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(1_048_576))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(10),
-        ))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
-}
-
-async fn health() -> Json<Value> {
-    Json(json!({"status":"ok","service":"affinity-api"}))
-}
-async fn ready() -> Json<Value> {
-    Json(json!({"status":"ready","dependencies":{"repository":"in_memory_demo"}}))
-}
-async fn metrics(State(state): State<AppState>) -> String {
-    let store = state.inner.read().await;
-    format!("# HELP affinity_events_total Accepted unique events\n# TYPE affinity_events_total counter\naffinity_events_total {}\n", store.events.len())
-}
-
-async fn ingest_event(
-    State(state): State<AppState>,
-    Json(event): Json<Event>,
-) -> Result<(StatusCode, Json<IngestResult>), ApiError> {
-    event.validate()?;
-    let mut store = state.inner.write().await;
-    if !store.event_ids.insert(event.event_id) {
-        return Ok((
-            StatusCode::OK,
-            Json(IngestResult {
-                event_id: event.event_id,
-                status: "duplicate",
-            }),
-        ));
-    }
-    let id = event.event_id;
-    store.events.push(event);
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(IngestResult {
-            event_id: id,
-            status: "accepted",
-        }),
-    ))
-}
-
 async fn ingest_batch(
     State(state): State<AppState>,
     Json(batch): Json<EventBatch>,
 ) -> Result<Json<BatchResult>, ApiError> {
     if batch.events.is_empty() || batch.events.len() > 500 {
-        return Err(ApiError::validation("batch must contain 1 to 500 events"));
+        return Err(ApiError::Validation(
+            "batch must contain between 1 and 500 events".into(),
+        ));
     }
-    let mut result = BatchResult {
-        accepted: 0,
-        duplicates: 0,
-        rejected: 0,
-        errors: vec![],
-    };
-    let mut store = state.inner.write().await;
+    let now = Utc::now();
+    let mut valid = Vec::with_capacity(batch.events.len());
+    let mut errors = Vec::new();
     for (index, event) in batch.events.into_iter().enumerate() {
-        if let Err(error) = event.validate() {
-            result.rejected += 1;
-            result.errors.push(BatchError {
+        match event.validate(now) {
+            Ok(()) => valid.push(event),
+            Err(message) => errors.push(BatchError {
                 index,
                 code: "validation_error",
-                message: error.to_string(),
-            });
-            continue;
-        }
-        if !store.event_ids.insert(event.event_id) {
-            result.duplicates += 1;
-        } else {
-            store.events.push(event);
-            result.accepted += 1;
+                message,
+            }),
         }
     }
-    Ok(Json(result))
-}
-
-async fn get_user(State(state): State<AppState>, Path(id): Path<String>) -> Json<UserProfile> {
-    let count = state
-        .inner
-        .read()
-        .await
-        .events
+    let statuses = state.repository.ingest(&valid).await?;
+    let accepted = statuses
         .iter()
-        .filter(|event| event.user_id == id)
+        .filter(|status| **status == IngestStatus::Accepted)
         .count();
-    Json(UserProfile {
-        user_id: id,
-        representation: if count < 5 {
-            "cold_start"
-        } else {
-            "behavioral"
-        },
-        observed_event_count: count,
-        profile_version: 1,
-        inferred_sensitive_attributes: vec![],
-    })
+    Ok(Json(BatchResult {
+        accepted,
+        duplicates: statuses.len() - accepted,
+        rejected: errors.len(),
+        errors,
+    }))
 }
 
-async fn get_interests(Path(id): Path<String>) -> Json<Value> {
-    Json(
-        json!({"user_id":id,"source":"deterministic_demo","long_term":[{"topic":"applied_ml","weight":0.86},{"topic":"data_systems","weight":0.78}],"recent":[{"topic":"retrieval_systems","weight":0.94}],"score_type":"recency_weighted_affinity"}),
-    )
+#[derive(Debug, Deserialize)]
+struct PageQuery {
+    #[serde(default = "default_page_limit")]
+    limit: usize,
+    #[serde(default)]
+    cursor: Option<usize>,
 }
 
-async fn get_history(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
-    let events: Vec<Event> = state
-        .inner
-        .read()
-        .await
-        .events
-        .iter()
-        .filter(|event| event.user_id == id)
-        .rev()
-        .take(50)
-        .cloned()
-        .collect();
-    Json(json!({"user_id":id,"items":events,"next_cursor":null}))
+const fn default_page_limit() -> usize {
+    50
 }
 
-fn demo_recommendations() -> Vec<Recommendation> {
-    [
-        (
-            "item_101",
-            "Practical retrieval systems",
-            "applied_ml",
-            0.913,
-            [0.88, 0.94, 0.76, 0.89],
-            "Matches recent retrieval reading and long-term ML interest.",
-        ),
-        (
-            "item_204",
-            "Event streams without drama",
-            "data_systems",
-            0.864,
-            [0.83, 0.78, 0.92, 0.86],
-            "Strong systems affinity and useful list diversity.",
-        ),
-        (
-            "item_311",
-            "Measuring representation drift",
-            "ml_operations",
-            0.821,
-            [0.85, 0.69, 0.81, 0.84],
-            "Semantic match to evaluation history; previously unseen.",
-        ),
-        (
-            "item_422",
-            "Model-debugging interface patterns",
-            "design_tools",
-            0.774,
-            [0.71, 0.83, 0.88, 0.78],
-            "Bridges design interest with current debugging intent.",
-        ),
-    ]
-    .into_iter()
-    .map(
-        |(id, title, category, score, c, explanation)| Recommendation {
-            content_id: id.into(),
-            title: title.into(),
-            category: category.into(),
-            score,
-            score_type: "heuristic_policy_score",
-            components: ScoreComponents {
-                relevance: c[0],
-                recency: c[1],
-                diversity: c[2],
-                quality: c[3],
-            },
-            explanation: explanation.into(),
-            model_version: "als-v1",
-        },
-    )
-    .collect()
+fn validated_page(query: PageQuery) -> Result<(usize, usize), ApiError> {
+    if !(1..=100).contains(&query.limit) {
+        return Err(ApiError::Validation(
+            "limit must be between 1 and 100".into(),
+        ));
+    }
+    Ok((query.limit, query.cursor.unwrap_or(0)))
+}
+
+async fn user_data(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(Vec<Event>, Vec<ContentItem>), ApiError> {
+    let (events, content) = tokio::try_join!(
+        state.repository.user_events(user_id, 1_000, 0),
+        state.repository.all_content()
+    )?;
+    Ok((events, content))
+}
+
+async fn get_user(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (events, content) = user_data(&state, &user_id).await?;
+    let profile = interests(&events, &content, Utc::now());
+    Ok(Json(json!({
+        "user_id":user_id,
+        "representation":if events.len()<5{"cold_start"}else{"behavioral"},
+        "observed_event_count":events.len(),
+        "profile_version":1,
+        "long_term_interest_count":profile.long_term.len(),
+        "recent_interest_count":profile.recent.len(),
+        "inferred_sensitive_attributes":[]
+    })))
+}
+
+async fn get_interests(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (events, content) = user_data(&state, &user_id).await?;
+    let profile = interests(&events, &content, Utc::now());
+    Ok(Json(
+        json!({"user_id":user_id,"source":"observed_behavior","long_term":profile.long_term,"recent":profile.recent,"score_type":"recency_weighted_affinity"}),
+    ))
+}
+
+async fn get_history(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (limit, offset) = validated_page(query)?;
+    let items = state
+        .repository
+        .user_events(&user_id, limit + 1, offset)
+        .await?;
+    let has_more = items.len() > limit;
+    let items: Vec<_> = items.into_iter().take(limit).collect();
+    Ok(Json(
+        json!({"user_id":user_id,"items":items,"next_cursor":has_more.then_some(offset+limit)}),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RecommendationQuery {
+    #[serde(default = "default_recommendation_limit")]
+    limit: usize,
+    #[serde(default = "default_relevance_weight")]
+    relevance_weight: f32,
+    #[serde(default = "default_recency_weight")]
+    recency_weight: f32,
+    #[serde(default = "default_quality_weight")]
+    quality_weight: f32,
+    #[serde(default = "default_diversity_weight")]
+    diversity_weight: f32,
+}
+
+const fn default_recommendation_limit() -> usize {
+    10
+}
+const fn default_relevance_weight() -> f32 {
+    0.55
+}
+const fn default_recency_weight() -> f32 {
+    0.20
+}
+const fn default_quality_weight() -> f32 {
+    0.25
+}
+const fn default_diversity_weight() -> f32 {
+    0.20
 }
 
 async fn get_recommendations(
+    State(state): State<AppState>,
     Path(user_id): Path<String>,
     Query(query): Query<RecommendationQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if !(1..=100).contains(&query.limit) {
-        return Err(ApiError::validation("limit must be between 1 and 100"));
+        return Err(ApiError::Validation(
+            "limit must be between 1 and 100".into(),
+        ));
     }
-    let items: Vec<_> = demo_recommendations()
-        .into_iter()
-        .take(query.limit)
-        .collect();
+    let options = RankingOptions {
+        relevance_weight: query.relevance_weight,
+        recency_weight: query.recency_weight,
+        quality_weight: query.quality_weight,
+        diversity_weight: query.diversity_weight,
+    }
+    .validate()
+    .map_err(ApiError::Validation)?;
+    let (events, content) = user_data(&state, &user_id).await?;
+    let result = recommend(&events, &content, options, query.limit, Utc::now());
+    state
+        .recommendation_requests
+        .fetch_add(1, Ordering::Relaxed);
     Ok(Json(
-        json!({"user_id":user_id,"strategy":query.strategy.unwrap_or_else(||"balanced".into()),"model_version":"als-v1","fallback_used":false,"items":items}),
+        json!({"user_id":user_id,"model_version":"affinity-ranker-v1","fallback_used":result.fallback_used,"items":result.items}),
     ))
 }
 
-async fn get_similar(Path(content_id): Path<String>) -> Json<Value> {
-    Json(
-        json!({"content_id":content_id,"model_version":"two-tower-v1","items":demo_recommendations().into_iter().take(3).collect::<Vec<_>>()}),
-    )
+async fn get_content(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({"items":state.repository.all_content().await?})))
 }
-async fn get_models() -> Json<Value> {
-    Json(
-        json!({"items":[{"id":"popularity-v1","status":"baseline","metrics":null},{"id":"als-v1","status":"configured","metrics":null},{"id":"two-tower-v1","status":"ready_to_train","metrics":null},{"id":"gru4rec-v1","status":"ready_to_train","metrics":null}]}),
-    )
+
+async fn get_similar(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let content = state.repository.all_content().await?;
+    let source = content
+        .iter()
+        .find(|item| item.content_id == content_id)
+        .ok_or_else(|| ApiError::NotFound("content".into()))?;
+    let mut items: Vec<_> = content
+        .iter()
+        .filter(|item| item.content_id != content_id)
+        .map(|item| {
+            let category_match = f32::from(item.category == source.category);
+            let score = 0.75 * category_match + 0.25 * item.quality_score;
+            json!({"content":item,"score":score,"score_type":"content_similarity_heuristic"})
+        })
+        .collect();
+    items.sort_by(|left, right| {
+        right["score"]
+            .as_f64()
+            .unwrap_or_default()
+            .total_cmp(&left["score"].as_f64().unwrap_or_default())
+    });
+    items.truncate(10);
+    Ok(Json(
+        json!({"content_id":content_id,"model_version":"content-similarity-v1","items":items}),
+    ))
 }
-async fn get_model_metrics(Path(id): Path<String>) -> Json<Value> {
-    Json(
-        json!({"model_id":id,"measured":false,"metrics":null,"message":"Run make evaluate to record measured metrics."}),
-    )
+
+async fn get_models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({"items":state.repository.models().await?})))
+}
+
+async fn get_model_metrics(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let model = state
+        .repository
+        .model(&model_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("model".into()))?;
+    Ok(Json(
+        json!({"model_id":model.id,"measured":model.metrics.is_some(),"metrics":model.metrics,"trained_at":model.trained_at,"dataset_version":model.dataset_version}),
+    ))
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
 }
 
 fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.strip_prefix("Bearer ") == Some(state.admin_token.as_ref()))
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| constant_time_equal(token.as_bytes(), state.admin_token.as_bytes()))
 }
+
+#[derive(Debug, Deserialize)]
+struct TrainingRequest {
+    model_id: String,
+}
+
 async fn start_training(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Json(request): Json<TrainingRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     if !authorized(&headers, &state) {
         return Err(ApiError::Unauthorized);
     }
+    state
+        .repository
+        .model(&request.model_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("model".into()))?;
+    let job_id = state
+        .repository
+        .create_training_job(&request.model_id)
+        .await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(
-            json!({"job_id":Uuid::new_v4(),"status":"queued","note":"Local worker must be running."}),
-        ),
+        Json(json!({"job_id":job_id,"model_id":request.model_id,"status":"queued"})),
     ))
 }
 
-async fn get_experiments(State(state): State<AppState>) -> Json<Value> {
-    let items = state.inner.read().await.experiments.clone();
-    Json(json!({"items":items}))
+async fn get_experiments(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({"items":state.repository.experiments().await?})))
 }
+
+#[derive(Debug, Deserialize)]
+struct CreateExperimentRequest {
+    name: String,
+    control: String,
+    treatment: String,
+    allocation: f64,
+}
+
 async fn create_experiment(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut experiment): Json<Experiment>,
+    Json(request): Json<CreateExperimentRequest>,
 ) -> Result<(StatusCode, Json<Experiment>), ApiError> {
     if !authorized(&headers, &state) {
         return Err(ApiError::Unauthorized);
     }
-    if experiment.name.trim().is_empty() || !(0.0..=1.0).contains(&experiment.allocation) {
-        return Err(ApiError::validation(
-            "name is required and allocation must be in [0, 1]",
+    if request.name.trim().is_empty() || request.name.len() > 120 {
+        return Err(ApiError::Validation(
+            "name must contain between 1 and 120 characters".into(),
         ));
     }
-    experiment.id = Uuid::new_v4().to_string();
-    experiment.status = "draft".into();
-    state
-        .inner
-        .write()
-        .await
-        .experiments
-        .push(experiment.clone());
+    if !(0.0..=1.0).contains(&request.allocation) {
+        return Err(ApiError::Validation(
+            "allocation must be between 0 and 1".into(),
+        ));
+    }
+    let experiment = state
+        .repository
+        .create_experiment(NewExperiment {
+            name: request.name,
+            control: request.control,
+            treatment: request.treatment,
+            allocation: request.allocation,
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(experiment)))
+}
+
+fn stable_assignment(experiment_id: Uuid, user_id: &str) -> f64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in experiment_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(user_id.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash as f64 / u64::MAX as f64
+}
+
+async fn get_assignment(
+    State(state): State<AppState>,
+    Path((experiment_id, user_id)): Path<(Uuid, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let experiment = state
+        .repository
+        .experiment(experiment_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("experiment".into()))?;
+    let bucket = stable_assignment(experiment_id, &user_id);
+    let (variant, model) = if bucket < experiment.allocation {
+        ("treatment", experiment.treatment.as_str())
+    } else {
+        ("control", experiment.control.as_str())
+    };
+    Ok(Json(
+        json!({"experiment_id":experiment_id,"user_id":user_id,"variant":variant,"model":model,"bucket":bucket}),
+    ))
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    if !authorized(&headers, &state) {
+        return Err(ApiError::Unauthorized);
+    }
+    let deleted_events = state.repository.delete_user(&user_id).await?;
+    Ok(Json(
+        json!({"user_id":user_id,"deleted_events":deleted_events,"status":"deleted"}),
+    ))
 }
 
 #[cfg(test)]
@@ -493,14 +624,15 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
+    use std::collections::HashMap;
     use tower::ServiceExt;
 
-    fn event(id: Uuid) -> Event {
+    fn event(id: Uuid, content_id: &str, event_type: EventType) -> Event {
         Event {
             event_id: id,
             user_id: "usr_test".into(),
-            content_id: Some("item_1".into()),
-            event_type: EventType::Click,
+            content_id: Some(content_id.into()),
+            event_type,
             timestamp: Utc::now(),
             session_id: "session_1".into(),
             context: HashMap::new(),
@@ -511,15 +643,15 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_event_is_idempotent() {
-        let app = app(AppState::demo("secret".into()));
-        let id = Uuid::new_v4();
+        let app = app(AppState::test("secret"));
+        let event = event(Uuid::new_v4(), "item_101", EventType::Click);
         for expected in [StatusCode::ACCEPTED, StatusCode::OK] {
             let response = app
                 .clone()
                 .oneshot(
                     Request::post("/v1/events")
                         .header("content-type", "application/json")
-                        .body(Body::from(serde_json::to_vec(&event(id)).unwrap()))
+                        .body(Body::from(serde_json::to_vec(&event).unwrap()))
                         .unwrap(),
                 )
                 .await
@@ -529,34 +661,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingested_behavior_changes_recommendations() {
+        let app = app(AppState::test("secret"));
+        let event = event(Uuid::new_v4(), "item_101", EventType::Save);
+        app.clone()
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&event).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::get("/v1/recommendations/usr_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!value["fallback_used"].as_bool().unwrap());
+        assert!(value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["content_id"] != "item_101"));
+    }
+
+    #[tokio::test]
     async fn admin_endpoint_requires_bearer_token() {
-        let response = app(AppState::demo("secret".into()))
+        let response = app(AppState::test("secret"))
             .oneshot(
                 Request::post("/v1/models/train")
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model_id":"affinity-ranker-v1"}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(std::str::from_utf8(&body).unwrap().contains("unauthorized"));
     }
 
-    #[tokio::test]
-    async fn recommendation_scores_are_labeled_heuristics() {
-        let response = app(AppState::demo("secret".into()))
-            .oneshot(
-                Request::get("/v1/recommendations/usr_test?limit=2")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["items"].as_array().unwrap().len(), 2);
-        assert_eq!(value["items"][0]["score_type"], "heuristic_policy_score");
+    #[test]
+    fn experiment_assignment_is_deterministic() {
+        let experiment_id = Uuid::new_v4();
+        assert_eq!(
+            stable_assignment(experiment_id, "user-42"),
+            stable_assignment(experiment_id, "user-42")
+        );
+    }
+
+    #[test]
+    fn token_comparison_handles_different_lengths() {
+        assert!(constant_time_equal(b"secret", b"secret"));
+        assert!(!constant_time_equal(b"secret", b"secret-long"));
+        assert!(!constant_time_equal(b"secret", b"public"));
     }
 }

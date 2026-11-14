@@ -1,6 +1,7 @@
 FROM rust:1.83-slim AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
+COPY infrastructure/migrations ./infrastructure/migrations
 COPY services/api ./services/api
 RUN cargo build --release --package affinity-api
 

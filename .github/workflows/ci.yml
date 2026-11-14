@@ -30,6 +30,22 @@ jobs:
   api:
     name: Rust API
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: affinity_test
+          POSTGRES_USER: affinity
+          POSTGRES_PASSWORD: affinity
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U affinity -d affinity_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://affinity:affinity@localhost:5432/affinity_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

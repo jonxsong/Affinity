@@ -1,5 +1,7 @@
+mod config;
+
 use affinity_api::{app, AppState};
-use std::net::SocketAddr;
+use config::Config;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -12,17 +14,14 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    let address: SocketAddr = std::env::var("AFFINITY_API_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".into())
-        .parse()
-        .expect("AFFINITY_API_ADDR must be a socket address");
-    let state = AppState::demo(
-        std::env::var("AFFINITY_ADMIN_TOKEN").unwrap_or_else(|_| "local-development-only".into()),
-    );
-    let listener = tokio::net::TcpListener::bind(address)
+    let config = Config::from_env().expect("invalid service configuration");
+    let state = AppState::connect(&config.database_url, config.admin_token)
+        .await
+        .expect("connect to PostgreSQL and apply migrations");
+    let listener = tokio::net::TcpListener::bind(config.address)
         .await
         .expect("bind API listener");
-    tracing::info!(%address, "Affinity API listening");
+    tracing::info!(address = %config.address, repository = "postgres", "Affinity API listening");
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
