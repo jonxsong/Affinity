@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import Image from "next/image";
 import {
   Activity,
   ArrowRight,
@@ -1287,12 +1288,14 @@ export function Dashboard() {
     <div className="shell">
       <aside className={`sidebar ${mobile ? "open" : ""}`}>
         <div className="brand">
-          <div className="brand-mark">
-            <span />
-            <span />
-            <span />
-          </div>
-          <strong>Affinity</strong>
+          <Image
+            className="brand-logo"
+            src="/affinity-logo.png"
+            alt="Affinity"
+            width={101}
+            height={36}
+            priority
+          />
           <Badge tone="muted">beta</Badge>
           <button
             onClick={() => setMobile(false)}

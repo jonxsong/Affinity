@@ -10,6 +10,10 @@ export const metadata: Metadata = {
   title: "Affinity — Recommendation intelligence",
   description:
     "Inspect user representations, compare recommenders, and understand every ranked result.",
+  icons: {
+    icon: "/affinity-logo.png",
+    shortcut: "/affinity-logo.png",
+  },
 };
 
 export default function RootLayout({

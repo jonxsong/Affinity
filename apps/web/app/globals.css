@@ -63,30 +63,10 @@ button {
   padding: 0 18px;
   border-bottom: 1px solid var(--border);
 }
-.brand > strong {
-  font-size: 15px;
-  letter-spacing: -0.02em;
-}
-.brand-mark {
-  width: 25px;
-  height: 25px;
-  position: relative;
-  display: grid;
-  place-items: center;
-}
-.brand-mark span {
-  position: absolute;
-  width: 5px;
-  height: 16px;
-  border: 1.5px solid var(--mint);
-  border-radius: 50%;
-  transform: rotate(60deg);
-}
-.brand-mark span:nth-child(2) {
-  transform: rotate(-60deg);
-}
-.brand-mark span:nth-child(3) {
-  transform: rotate(0);
+.brand-logo {
+  width: 101px;
+  height: 36px;
+  object-fit: contain;
 }
 .badge {
   display: inline-flex;
