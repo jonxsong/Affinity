@@ -19,7 +19,7 @@ An open-source recommendation platform for learning from behavior, training mode
 ![Affinity console preview](docs/assets/dashboard-preview.svg)
 
 > [!NOTE]
-> The hosted console is a static client with an explicit showcase fallback. Run the local stack for durable event ingestion, live user profiles, explained recommendations, experiments, and queued model training. Synthetic data is always labeled.
+> The hosted console is a working application, not a static mock: its same-origin Worker validates events, stores behavior in D1, and returns explained, personalized recommendations. The Docker stack provides the fuller Rust/PostgreSQL/Python research environment. Synthetic data is always labeled.
 
 ## Why Affinity
 
@@ -35,7 +35,7 @@ No OpenAI key—or any other paid API key—is required. Affinity’s online pol
 
 ## Architecture
 
-The first production shape is a modular monolith: Rust owns the low-latency online path; Python owns offline learning and evaluation; stable contracts keep the extraction path open if measurements justify it.
+Affinity has two intentional deployment shapes. The hosted product uses a same-origin JavaScript Worker and D1 so the public console works without a separate server. The complete local/research stack is a modular monolith: Rust owns the low-latency online path, while Python owns offline learning and evaluation.
 
 ![Hand-drawn Affinity architecture diagram](docs/assets/architecture.svg)
 
@@ -43,17 +43,24 @@ The first production shape is a modular monolith: Rust owns the low-latency onli
 <summary><strong>Text-rendered data flow</strong></summary>
 
 ```mermaid
-flowchart LR
-  UI[Next.js console] --> API[Rust / Axum API]
-  SDK[SDKs and clients] --> API
-  API --> PG[(PostgreSQL)]
-  PG --> JOBS[Durable training queue]
-  JOBS --> TRAIN[Python worker]
-  TRAIN --> ART[(Versioned artifacts)]
-  TRAIN --> PG
-  PG --> API
-  API --> RANK[Filter · rank · diversify]
-  RANK --> UI
+flowchart TB
+  UI[Next.js console]
+  subgraph Hosted[Hosted product]
+    WORKER[Same-origin Worker API]
+    D1[(Cloudflare D1)]
+    WORKER <--> D1
+  end
+  subgraph Local[Complete local / research stack]
+    API[Rust / Axum API]
+    PG[(PostgreSQL)]
+    TRAIN[Python training worker]
+    ART[(Versioned artifacts)]
+    API <--> PG
+    PG --> TRAIN --> ART
+    TRAIN --> PG
+  end
+  UI --> WORKER
+  UI --> API
 ```
 
 </details>
@@ -68,7 +75,7 @@ pnpm install
 pnpm dev
 ```
 
-Open `http://localhost:3000`. Without the API, the console uses deterministic, clearly labeled showcase data; when the API is available it switches to live mode automatically.
+Open `http://localhost:3000`. For frontend-only work the console can use deterministic, clearly labeled showcase data; with the API available it switches to live mode automatically. The hosted deployment always calls its same-origin Worker API.
 
 ### Run the complete local stack
 
@@ -109,6 +116,8 @@ Admin mutations use `AFFINITY_ADMIN_TOKEN`; Compose supplies a development-only 
 
 ```text
 apps/web/                 Next.js 16 console with live API and showcase fallback
+hosting/worker/           hosted same-origin API and static asset server
+drizzle/                  hosted D1 migrations
 services/api/             Rust/Axum events, users, models, experiments, ranking
 services/ml-service/      Container entrypoint for offline jobs
 ml/affinity_ml/           datasets, features, models, evaluation, profiling
@@ -171,6 +180,7 @@ Errors use a stable envelope with `code`, `message`, and `request_id`. Recommend
 | Surface | Checks |
 |---|---|
 | Web | ESLint, strict TypeScript, Vitest, production static export |
+| Hosted API | Node test runner, Worker syntax check, D1 migration/deploy verification |
 | Rust | rustfmt, Clippy with warnings denied, unit/API/PostgreSQL integration tests |
 | Python | Ruff, temporal leakage, deterministic seeds, full training-artifact smoke test, model shapes |
 | Infrastructure | Compose validation and health contracts |
@@ -181,7 +191,7 @@ All required checks run in [GitHub Actions](https://github.com/jonxsong/Affinity
 
 - The live Rust serving policy uses durable behavioral signals; trained SVD/two-tower/GRU artifacts are registered but are not yet loaded into the online candidate path.
 - Redis, Qdrant, Redpanda, and MLflow are optional topology extension points, not dependencies of the current request path.
-- The hosted `.chatgpt.site` build is a static console and cannot expose your local interaction history.
+- Hosted D1 and local PostgreSQL are separate data planes; interaction history does not automatically replicate between them.
 - No throughput or production-latency number is claimed yet.
 
 ## Roadmap
