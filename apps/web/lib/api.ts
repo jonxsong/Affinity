@@ -187,6 +187,16 @@ export const api = {
       `/v1/users/${encodeURIComponent(userId)}/history?limit=50`,
       historySchema,
     ),
+  deleteUser: (userId: string) =>
+    request(
+      `/v1/users/${encodeURIComponent(userId)}`,
+      z.object({
+        user_id: z.string(),
+        deleted_events: z.number(),
+        status: z.literal("deleted"),
+      }),
+      { method: "DELETE" },
+    ),
   recommendations: (
     userId: string,
     options: { diversity: number; freshness: number; limit?: number },

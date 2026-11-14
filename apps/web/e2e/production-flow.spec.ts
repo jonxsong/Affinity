@@ -73,6 +73,17 @@ test.beforeEach(async ({ page }) => {
         body: JSON.stringify({ event_id: "event-test", status: "accepted" }),
       });
     }
+    if (url.pathname.startsWith("/v1/users/") && request.method() === "DELETE") {
+      return route.fulfill({
+        contentType: "application/json",
+        headers: cors,
+        body: JSON.stringify({
+          user_id: decodeURIComponent(url.pathname.split("/").at(-1) || ""),
+          deleted_events: 3,
+          status: "deleted",
+        }),
+      });
+    }
     return route.continue();
   });
 });
@@ -94,4 +105,12 @@ test("event composer writes a durable signal", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Ingest event" }).click();
   await expect(page.getByText("accepted", { exact: true })).toBeVisible();
+});
+
+test("user explorer confirms and completes privacy deletion", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "User explorer" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete data" }).click();
+  await expect(page.getByRole("button", { name: "Deleted 3" })).toBeVisible();
 });

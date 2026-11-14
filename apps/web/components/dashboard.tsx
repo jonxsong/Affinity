@@ -25,6 +25,7 @@ import {
   Search,
   Settings2,
   Sparkles,
+  Trash2,
   Users,
   X,
   Zap,
@@ -453,6 +454,7 @@ function Overview({ onOpenPlayground }: { onOpenPlayground: () => void }) {
 function UserExplorer() {
   const [selected, setSelected] = useState(users[0]);
   const [lookup, setLookup] = useState(selected.id);
+  const queryClient = useQueryClient();
   const profile = useQuery({
     queryKey: ["profile", selected.id],
     queryFn: () => api.profile(selected.id),
@@ -464,6 +466,17 @@ function UserExplorer() {
   const history = useQuery({
     queryKey: ["history", selected.id],
     queryFn: () => api.history(selected.id),
+  });
+  const deletion = useMutation({
+    mutationFn: () => api.deleteUser(selected.id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        predicate: (query) =>
+          ["profile", "interests", "history", "overview"].includes(
+            String(query.queryKey[0]),
+          ),
+      });
+    },
   });
   const liveInterests = useMemo(() => {
     if (!interestQuery.data) return interests;
@@ -592,6 +605,25 @@ function UserExplorer() {
               }
             >
               <Code2 size={14} /> Copy JSON
+            </button>
+            <button
+              className="button"
+              disabled={deletion.isPending}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Delete all stored events for ${selected.id}? This cannot be undone.`,
+                  )
+                )
+                  deletion.mutate();
+              }}
+            >
+              <Trash2 size={14} />
+              {deletion.isPending
+                ? "Deleting…"
+                : deletion.isSuccess
+                  ? `Deleted ${deletion.data.deleted_events}`
+                  : "Delete data"}
             </button>
           </section>
           <div className="split-grid">
